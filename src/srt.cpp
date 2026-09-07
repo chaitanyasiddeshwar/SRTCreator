@@ -85,9 +85,12 @@ bool write(const std::vector<Segment>& segs, const std::string& path,
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) { err = "could not open output for writing: " + path; return false; }
     int idx = 1;
+    std::string prev; // for collapsing consecutive duplicate cues (whisper loops)
     for (const auto& seg : segs) {
         std::string text = wrap(seg.text, max_line_length); // also trims/collapses
         if (text.empty()) continue;
+        if (text == prev) continue; // drop repeated hallucination lines
+        prev = text;
         // SRT uses CRLF line endings; convert any '\n' from wrapping to "\r\n".
         std::string crlf;
         for (char c : text) { if (c == '\n') crlf += "\r\n"; else crlf.push_back(c); }

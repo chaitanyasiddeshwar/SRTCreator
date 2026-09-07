@@ -135,6 +135,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Vocal isolation removes music, so whisper's VAD is unnecessary and its
+    // long-segment remapping hurts; skip it when isolating.
+    if (isolate) vad = false;
+
     // 2) VAD model (optional; disable gracefully if unavailable).
     std::string vad_path;
     if (vad) {

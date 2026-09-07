@@ -120,7 +120,7 @@ static void do_job(Job job) {
     }
 
     std::string vad_path;
-    bool vad = job.vad;
+    bool vad = job.vad && !job.isolate; // isolation removes music; VAD not needed
     if (vad) {
         post_str(hwnd, WM_APP_STATUS, 0, L"Preparing VAD model…");
         if (!models::ensure_vad(models_dir, true, vad_path, err, dl)) {
