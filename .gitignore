@@ -11,6 +11,9 @@
 # Vendored FFmpeg dev/shared libs (provided locally, not committed)
 /third_party/ffmpeg/
 
+# ONNX Runtime (DirectML) - provided locally, not committed (large binaries)
+/third_party/onnxruntime/
+
 # Editor / OS cruft
 .vscode/
 .idea/

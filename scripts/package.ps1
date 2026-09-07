@@ -49,6 +49,13 @@ foreach ($d in "MSVCP140.dll","VCRUNTIME140.dll","VCRUNTIME140_1.dll","VCOMP140.
     Copy-Item (Join-Path $sys $d) $stage
 }
 
+# 4b) ONNX Runtime (DirectML) for vocal isolation.
+$ortbin = Join-Path $Root "third_party\onnxruntime\bin"
+foreach ($d in "onnxruntime.dll","DirectML.dll") {
+    $p = Join-Path $ortbin $d
+    if (Test-Path $p) { Copy-Item $p $stage }
+}
+
 # 5) Docs + licenses.
 Copy-Item (Join-Path $Root "README.md") $stage
 Copy-Item (Join-Path $Root "THIRD_PARTY_NOTICES.txt") $stage
