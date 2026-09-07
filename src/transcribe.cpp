@@ -77,13 +77,13 @@ bool run(const std::vector<float>& pcm, const Options& opts,
         wp.vad            = true;
         wp.vad_model_path = opts.vad_model_path.c_str();
         wp.vad_params     = whisper_vad_default_params();
-        // Tuned for film mixes: a lower threshold keeps dialogue that has music
-        // under it; generous padding avoids clipping word edges; a larger silence
-        // gap avoids chopping natural pauses mid-sentence.
-        wp.vad_params.threshold              = 0.35f;
-        wp.vad_params.min_silence_duration_ms = 200;
+        // Tuned for film mixes. The critical one is max_speech_duration_s: the
+        // default is unbounded, so under continuous score VAD merges minutes of
+        // audio into one "speech" region and whisper emits a single sparse cue
+        // (wrong timing, most dialogue lost). Capping it forces fine segments.
+        // Generous padding avoids clipping word edges.
+        wp.vad_params.max_speech_duration_s  = 15.0f;
         wp.vad_params.speech_pad_ms          = 200;
-        wp.vad_params.samples_overlap        = 0.20f;
     }
 
     if (opts.on_segment) {
