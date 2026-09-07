@@ -25,6 +25,10 @@ bool download(const std::string& name, const std::string& models_dir,
               std::string& out_path, std::string& err,
               const Progress& on_progress = {});
 
+// Generic download of a URL to a destination file (creates parent dirs).
+bool fetch(const std::string& url, const std::string& dest, std::string& err,
+           const Progress& on_progress = {});
+
 // Silero VAD model path + fetch.
 std::string vad_model_path(const std::string& models_dir);
 bool ensure_vad(const std::string& models_dir, bool allow_download,

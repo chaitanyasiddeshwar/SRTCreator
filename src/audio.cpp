@@ -6,6 +6,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/mathematics.h>
 #include <libswresample/swresample.h>
 }
 
@@ -15,7 +16,7 @@ namespace {
 
 // Resample one decoded frame into out_pcm (mono, interleaved float == one
 // float per sample). Returns false on a hard swresample error.
-bool append_frame(SwrContext* swr, AVFrame* frame, std::vector<float>& out) {
+bool append_frame(SwrContext* swr, AVFrame* frame, int out_nch, std::vector<float>& out) {
     int in_samples = frame ? frame->nb_samples : 0;
     const uint8_t** in_data = frame ? (const uint8_t**)frame->extended_data : nullptr;
 
@@ -23,12 +24,12 @@ bool append_frame(SwrContext* swr, AVFrame* frame, std::vector<float>& out) {
     if (max_out <= 0) return true;
 
     size_t cur = out.size();
-    out.resize(cur + (size_t)max_out);
+    out.resize(cur + (size_t)max_out * out_nch);
     uint8_t* out_ptr = reinterpret_cast<uint8_t*>(out.data() + cur);
 
     int got = swr_convert(swr, &out_ptr, max_out, in_data, in_samples);
     if (got < 0) { out.resize(cur); return false; }
-    out.resize(cur + (size_t)got);
+    out.resize(cur + (size_t)got * out_nch);
     return true;
 }
 
@@ -79,13 +80,14 @@ bool decode(const std::string& path, const DecodeOptions& opts,
         return false;
     }
 
-    // Target: mono, opts.sample_rate, interleaved float32.
+    // Target layout: opts.channels (1 or 2), opts.sample_rate, interleaved float.
+    int out_nch = opts.channels < 1 ? 1 : opts.channels;
     AVChannelLayout out_ch;
-    av_channel_layout_default(&out_ch, 1);
+    av_channel_layout_default(&out_ch, out_nch);
 
     // Dialogue lives in the Front-Center channel of a 5.1/7.1 mix. When asked,
-    // extract ONLY that channel (via a rematrix matrix) instead of a downmix that
-    // would fold music/effects from every channel into the result.
+    // route ONLY that channel into every output channel (via a rematrix matrix)
+    // instead of a downmix that folds music/effects from every channel in.
     int in_ch = ctx->ch_layout.nb_channels;
     int fc_index = opts.center_channel_only
         ? av_channel_layout_index_from_channel(&ctx->ch_layout, AV_CHAN_FRONT_CENTER)
@@ -106,12 +108,12 @@ bool decode(const std::string& path, const DecodeOptions& opts,
     }
 
     if (fc_index >= 0) {
-        std::vector<double> matrix((size_t)in_ch, 0.0);
-        matrix[(size_t)fc_index] = 1.0; // mono out = 1.0 * Front-Center
+        std::vector<double> matrix((size_t)out_nch * in_ch, 0.0);
+        for (int o = 0; o < out_nch; ++o) matrix[(size_t)o * in_ch + fc_index] = 1.0;
         swr_set_matrix(swr, matrix.data(), in_ch);
-        logging::logf("INFO", "audio: isolating center channel (index %d of %d)", fc_index, in_ch);
+        logging::logf("INFO", "audio: center channel -> %d ch (fc idx %d of %d)", out_nch, fc_index, in_ch);
     } else if (opts.center_channel_only) {
-        logging::logf("INFO", "audio: no center channel (%d ch) - downmixing to mono", in_ch);
+        logging::logf("INFO", "audio: no center channel (%d ch) - downmixing", in_ch);
     }
 
     if (swr_init(swr) < 0) {
@@ -128,7 +130,7 @@ bool decode(const std::string& path, const DecodeOptions& opts,
     bool ok = true;
 
     const size_t limit_samples = opts.max_seconds > 0.0
-        ? (size_t)(opts.max_seconds * opts.sample_rate) : 0;
+        ? (size_t)(opts.max_seconds * opts.sample_rate) * out_nch : 0;
 
     // Total seconds for progress: the limit if set, else the container duration.
     double total_sec = 0.0;
@@ -140,14 +142,14 @@ bool decode(const std::string& path, const DecodeOptions& opts,
         if (pkt->stream_index == stream_index) {
             if (avcodec_send_packet(ctx, pkt) >= 0) {
                 while (avcodec_receive_frame(ctx, frame) >= 0) {
-                    if (!append_frame(swr, frame, out_pcm)) { ok = false; break; }
+                    if (!append_frame(swr, frame, out_nch, out_pcm)) { ok = false; break; }
                 }
             }
         }
         av_packet_unref(pkt);
 
         if (opts.on_progress && total_sec > 0.0) {
-            double done = (double)out_pcm.size() / opts.sample_rate;
+            double done = (double)out_pcm.size() / ((double)opts.sample_rate * out_nch);
             int pct = (int)(done / total_sec * 100.0);
             if (pct > 100) pct = 100;
             if (pct != last_pct) { last_pct = pct; opts.on_progress(pct); }
@@ -159,11 +161,11 @@ bool decode(const std::string& path, const DecodeOptions& opts,
     if (ok) {
         avcodec_send_packet(ctx, nullptr);
         while (avcodec_receive_frame(ctx, frame) >= 0) {
-            if (!append_frame(swr, frame, out_pcm)) { ok = false; break; }
+            if (!append_frame(swr, frame, out_nch, out_pcm)) { ok = false; break; }
         }
     }
     // Flush resampler.
-    if (ok) ok = append_frame(swr, nullptr, out_pcm);
+    if (ok) ok = append_frame(swr, nullptr, out_nch, out_pcm);
 
     if (!ok) err = "audio decode/resample failed";
 
@@ -176,6 +178,52 @@ bool decode(const std::string& path, const DecodeOptions& opts,
 
     if (ok && out_pcm.empty()) { err = "no audio samples decoded"; return false; }
     return ok;
+}
+
+bool resample_to_mono(const std::vector<float>& in, int in_rate, int in_channels,
+                      int out_rate, std::vector<float>& out, std::string& err) {
+    out.clear();
+    if (in.empty()) return true;
+
+    AVChannelLayout in_ch, out_ch;
+    av_channel_layout_default(&in_ch, in_channels);
+    av_channel_layout_default(&out_ch, 1);
+
+    SwrContext* swr = nullptr;
+    if (swr_alloc_set_opts2(&swr, &out_ch, AV_SAMPLE_FMT_FLT, out_rate,
+                            &in_ch, AV_SAMPLE_FMT_FLT, in_rate, 0, nullptr) < 0
+        || !swr || swr_init(swr) < 0) {
+        err = "resampler init failed";
+        if (swr) swr_free(&swr);
+        av_channel_layout_uninit(&in_ch);
+        av_channel_layout_uninit(&out_ch);
+        return false;
+    }
+
+    int in_samples = (int)(in.size() / in_channels);
+    int64_t out_max = av_rescale_rnd(swr_get_delay(swr, in_rate) + in_samples,
+                                     out_rate, in_rate, AV_ROUND_UP) + 16;
+    out.resize((size_t)out_max);
+
+    const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(in.data());
+    uint8_t* out_ptr = reinterpret_cast<uint8_t*>(out.data());
+    int got = swr_convert(swr, &out_ptr, (int)out_max, &in_ptr, in_samples);
+    int total = got > 0 ? got : 0;
+    for (;;) {
+        int rem = (int)out_max - total;
+        if (rem <= 0) break;
+        uint8_t* op = reinterpret_cast<uint8_t*>(out.data() + total);
+        int g = swr_convert(swr, &op, rem, nullptr, 0);
+        if (g <= 0) break;
+        total += g;
+    }
+    out.resize(total > 0 ? total : 0);
+
+    swr_free(&swr);
+    av_channel_layout_uninit(&in_ch);
+    av_channel_layout_uninit(&out_ch);
+    if (total <= 0) { err = "resample produced no output"; return false; }
+    return true;
 }
 
 } // namespace audio

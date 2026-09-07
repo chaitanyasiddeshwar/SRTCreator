@@ -11,6 +11,7 @@
 #include "transcribe.h"
 #include "srt.h"
 #include "models.h"
+#include "separate.h"
 #include "log.h"
 
 namespace {
@@ -34,6 +35,8 @@ void usage() {
         "      --no-flash-attn      Disable flash attention (on by default)\n"
         "      --no-vad             Disable Silero VAD (on by default)\n"
         "      --no-center          Don't isolate the center channel (dialogue)\n"
+        "      --isolate-vocals     Remove music/effects with a separation model first\n"
+        "      --vocal-model <name> Vocal model: Kim_Vocal_2 (default), etc.\n"
         "      --word-timestamps    Emit word-level timing\n"
         "      --max-line-length <n> Wrap subtitles to <n> chars/line (default 42; 0=off)\n"
         "      --threads <n>        Worker threads (default: auto)\n"
@@ -72,6 +75,8 @@ int main(int argc, char** argv) {
     std::string models_dir, download_name, threads_s, stream_s, duration_s, maxline_s;
     bool translate = false, flash = true, vad = true, word_ts = false, verbose = false;
     bool center = true; // isolate Front-Center (dialogue) for multichannel sources
+    bool isolate = false;               // vocal isolation (music removal)
+    std::string vocal_model = "Kim_Vocal_2";
     int max_line_length = 42; // Netflix-style default; 0 disables wrapping
 
     for (int i = 1; i < argc; ++i) {
@@ -90,6 +95,8 @@ int main(int argc, char** argv) {
         else if (a == "--vad")             vad = true;
         else if (a == "--no-center")       center = false;
         else if (a == "--center")          center = true;
+        else if (a == "--isolate-vocals" || a == "--vocals") isolate = true;
+        else if (a == "--vocal-model")     { if (!take(argc, argv, i, "--vocal-model", vocal_model)) return 2; }
         else if (a == "--word-timestamps") word_ts = true;
         else if (a == "--threads")         { if (!take(argc, argv, i, "--threads", threads_s)) return 2; }
         else if (a == "--models-dir")      { if (!take(argc, argv, i, "--models-dir", models_dir)) return 2; }
@@ -141,21 +148,43 @@ int main(int argc, char** argv) {
                   input.c_str(), model_path.c_str(), language.c_str(),
                   (int)translate, (int)vad, max_line_length);
 
-    // 3) Decode audio -> 16 kHz mono f32.
-    std::fprintf(stderr, "[srt] decoding audio: %s\n", input.c_str());
-    logging::info("decoding audio");
+    // 3) Decode audio (and optionally isolate vocals) -> 16 kHz mono f32.
+    double maxsec = duration_s.empty() ? 0.0 : std::atof(duration_s.c_str());
     std::vector<float> pcm;
-    audio::DecodeOptions dopts;
-    dopts.stream_index = stream;
-    dopts.max_seconds  = duration_s.empty() ? 0.0 : std::atof(duration_s.c_str());
-    dopts.center_channel_only = center;
-    if (!audio::decode(input, dopts, pcm, err)) {
-        logging::error("decode failed: " + err);
-        std::fprintf(stderr, "error: %s\n", err.c_str());
-        return 1;
+    if (isolate) {
+        std::fprintf(stderr, "[srt] decoding (44.1k stereo for separation): %s\n", input.c_str());
+        logging::info("decoding for separation");
+        audio::DecodeOptions d;
+        d.sample_rate = 44100; d.channels = 2;
+        d.stream_index = stream; d.max_seconds = maxsec; d.center_channel_only = center;
+        std::vector<float> mix;
+        if (!audio::decode(input, d, mix, err)) {
+            logging::error("decode failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+        }
+        std::string mpath; separate::Params sp;
+        if (!separate::ensure_model(vocal_model, models_dir, true, mpath, sp, err)) {
+            logging::error("vocal model: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+        }
+        std::fprintf(stderr, "[srt] isolating vocals (%s) ...\n", vocal_model.c_str());
+        logging::logf("INFO", "isolating vocals with %s", vocal_model.c_str());
+        std::vector<float> vocals;
+        if (!separate::isolate_vocals(mix, mpath, sp, vocals, nullptr, err)) {
+            logging::error("separation failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+        }
+        if (!audio::resample_to_mono(vocals, 44100, 1, 16000, pcm, err)) {
+            logging::error("resample failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+        }
+    } else {
+        std::fprintf(stderr, "[srt] decoding audio: %s\n", input.c_str());
+        logging::info("decoding audio");
+        audio::DecodeOptions dopts;
+        dopts.stream_index = stream; dopts.max_seconds = maxsec; dopts.center_channel_only = center;
+        if (!audio::decode(input, dopts, pcm, err)) {
+            logging::error("decode failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+        }
     }
-    std::fprintf(stderr, "[srt] decoded %.1f min of audio\n", pcm.size() / 16000.0 / 60.0);
-    logging::logf("INFO", "decoded %.1f min (%zu samples)", pcm.size() / 16000.0 / 60.0, pcm.size());
+    std::fprintf(stderr, "[srt] audio ready: %.1f min\n", pcm.size() / 16000.0 / 60.0);
+    logging::logf("INFO", "audio ready %.1f min (%zu samples)", pcm.size() / 16000.0 / 60.0, pcm.size());
 
     // 4) Transcribe.
     std::fprintf(stderr, "[srt] transcribing with %s ...\n", model_path.c_str());

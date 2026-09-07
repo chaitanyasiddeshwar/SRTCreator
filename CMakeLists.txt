@@ -44,6 +44,9 @@ if(NOT EXISTS "${FFMPEG_DIR}/include")
     "Provide include\\, lib\\, bin\\ there (see README / CLAUDE.md §4).")
 endif()
 
+# ONNX Runtime (DirectML) for vocal isolation.
+set(ORT_DIR "${CMAKE_SOURCE_DIR}/third_party/onnxruntime")
+
 # Core pipeline shared by the CLI and the GUI.
 add_library(srtcore STATIC
   src/audio.cpp
@@ -51,15 +54,18 @@ add_library(srtcore STATIC
   src/srt.cpp
   src/models.cpp
   src/log.cpp
+  src/separate.cpp
 )
 target_include_directories(srtcore PUBLIC
   "${CMAKE_SOURCE_DIR}/src"
+  "${CMAKE_SOURCE_DIR}/third_party"
   "${FFMPEG_DIR}/include"
+  "${ORT_DIR}/include"
   "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/include"
   "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/ggml/include"
 )
-target_link_directories(srtcore PUBLIC "${FFMPEG_DIR}/lib")
-target_link_libraries(srtcore PUBLIC whisper avformat avcodec avutil swresample)
+target_link_directories(srtcore PUBLIC "${FFMPEG_DIR}/lib" "${ORT_DIR}/lib")
+target_link_libraries(srtcore PUBLIC whisper avformat avcodec avutil swresample onnxruntime)
 
 # CLI and GUI executables.
 add_executable(srt src/main.cpp)
@@ -85,6 +91,12 @@ function(stage_runtime_dlls tgt)
   if(_ff)
     add_custom_command(TARGET ${tgt} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ff} $<TARGET_FILE_DIR:${tgt}>
+      COMMAND_EXPAND_LISTS)
+  endif()
+  file(GLOB _ort "${ORT_DIR}/bin/*.dll")   # onnxruntime.dll + DirectML.dll
+  if(_ort)
+    add_custom_command(TARGET ${tgt} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ort} $<TARGET_FILE_DIR:${tgt}>
       COMMAND_EXPAND_LISTS)
   endif()
   if(DEFINED ENV{CUDA_PATH})

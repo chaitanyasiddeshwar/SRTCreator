@@ -149,6 +149,13 @@ bool resolve(const std::string& spec, const std::string& models_dir,
     return download(spec, models_dir, out_path, err, on_progress);
 }
 
+bool fetch(const std::string& url, const std::string& dest, std::string& err,
+           const Progress& on_progress) {
+    size_t slash = dest.find_last_of("/\\");
+    if (slash != std::string::npos) ensure_dir(dest.substr(0, slash));
+    return download_url(url, dest, err, on_progress);
+}
+
 std::string vad_model_path(const std::string& models_dir) {
     return models_dir + "\\" + kVadFile;
 }
