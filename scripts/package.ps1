@@ -24,8 +24,10 @@ $stage = Join-Path $dist "SRTCreator"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-# 1) The executable.
+# 1) The executables (CLI + GUI).
 Copy-Item $exe $stage
+$gui = Join-Path $build "srtgui.exe"
+if (Test-Path $gui) { Copy-Item $gui $stage }
 
 # 2) FFmpeg DLLs - exactly the four the exe links (not avfilter/avdevice/swscale).
 foreach ($d in "avformat-63.dll","avcodec-63.dll","avutil-61.dll","swresample-7.dll") {

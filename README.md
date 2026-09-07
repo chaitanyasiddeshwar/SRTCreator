@@ -47,7 +47,20 @@ The subtitle file is written next to the input (`movie.srt`) unless you pass
 
 ---
 
-## Usage
+## GUI (drag-and-drop)
+
+`srtgui.exe` is a minimal window: **drag a media file onto it** and it decodes,
+transcribes, shows the subtitles live in a panel with a progress bar, and saves
+`<input>.srt` next to the file. All the main options are checkboxes/dropdowns:
+
+- Checkboxes: **Translate → English**, **VAD**, **Flash attention**,
+  **Word timestamps**, **Wrap lines (42)**
+- Dropdowns: **Model** and **Language**
+
+No console needed — just double-click `srtgui.exe`. (First run may briefly show a
+console window while a model downloads.)
+
+## Usage (CLI)
 
 ```
 srt <input> [options]

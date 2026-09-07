@@ -7,6 +7,32 @@
 
 namespace transcribe {
 
+namespace {
+
+// Fired by whisper as new segments are decoded; forwards each to on_segment.
+void on_new_segment(whisper_context* ctx, whisper_state* /*state*/,
+                    int n_new, void* user_data) {
+    const Options* o = static_cast<const Options*>(user_data);
+    if (!o->on_segment) return;
+    int n = whisper_full_n_segments(ctx);
+    for (int i = n - n_new; i < n; ++i) {
+        srt::Segment s;
+        s.t0 = whisper_full_get_segment_t0(ctx, i) * 0.01;
+        s.t1 = whisper_full_get_segment_t1(ctx, i) * 0.01;
+        const char* txt = whisper_full_get_segment_text(ctx, i);
+        s.text = txt ? txt : "";
+        o->on_segment(s);
+    }
+}
+
+void on_progress_cb(whisper_context* /*ctx*/, whisper_state* /*state*/,
+                    int progress, void* user_data) {
+    const Options* o = static_cast<const Options*>(user_data);
+    if (o->on_progress) o->on_progress(progress);
+}
+
+} // namespace
+
 bool run(const std::vector<float>& pcm, const Options& opts,
          std::vector<srt::Segment>& out, std::string& err) {
     out.clear();
@@ -50,6 +76,15 @@ bool run(const std::vector<float>& pcm, const Options& opts,
         wp.vad            = true;
         wp.vad_model_path = opts.vad_model_path.c_str();
         wp.vad_params     = whisper_vad_default_params();
+    }
+
+    if (opts.on_segment) {
+        wp.new_segment_callback           = on_new_segment;
+        wp.new_segment_callback_user_data = const_cast<Options*>(&opts);
+    }
+    if (opts.on_progress) {
+        wp.progress_callback           = on_progress_cb;
+        wp.progress_callback_user_data = const_cast<Options*>(&opts);
     }
 
     if (whisper_full(ctx, wp, pcm.data(), (int)pcm.size()) != 0) {

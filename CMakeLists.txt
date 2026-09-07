@@ -44,46 +44,52 @@ if(NOT EXISTS "${FFMPEG_DIR}/include")
     "Provide include\\, lib\\, bin\\ there (see README / CLAUDE.md §4).")
 endif()
 
-add_executable(srt
-  src/main.cpp
+# Core pipeline shared by the CLI and the GUI.
+add_library(srtcore STATIC
   src/audio.cpp
   src/transcribe.cpp
   src/srt.cpp
   src/models.cpp
 )
-
-target_include_directories(srt PRIVATE
+target_include_directories(srtcore PUBLIC
+  "${CMAKE_SOURCE_DIR}/src"
   "${FFMPEG_DIR}/include"
   "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/include"
   "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/ggml/include"
 )
-target_link_directories(srt PRIVATE "${FFMPEG_DIR}/lib")
-target_link_libraries(srt PRIVATE whisper avformat avcodec avutil swresample)
+target_link_directories(srtcore PUBLIC "${FFMPEG_DIR}/lib")
+target_link_libraries(srtcore PUBLIC whisper avformat avcodec avutil swresample)
+
+# CLI and GUI executables.
+add_executable(srt src/main.cpp)
+target_link_libraries(srt PRIVATE srtcore)
+
+add_executable(srtgui WIN32 src/gui/main_gui.cpp)
+target_link_libraries(srtgui PRIVATE srtcore comctl32)
 
 # ---------------------------------------------------------------------------
-# Stage runtime DLLs next to srt.exe so it runs from the build dir.
+# Stage runtime DLLs (FFmpeg + CUDA) next to each exe so they run from build\.
 # ---------------------------------------------------------------------------
-file(GLOB FFMPEG_DLLS "${FFMPEG_DIR}/bin/*.dll")
-if(FFMPEG_DLLS)
-  add_custom_command(TARGET srt POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} $<TARGET_FILE_DIR:srt>
-    COMMAND_EXPAND_LISTS)
-endif()
-
-# CUDA runtime DLLs (cudart / cublas / cublasLt) - shipped alongside the exe.
-if(DEFINED ENV{CUDA_PATH})
-  file(TO_CMAKE_PATH "$ENV{CUDA_PATH}" _cuda_path)
-  # CUDA 12 ships these in bin\; CUDA 13 moved them to bin\x64\.
-  file(GLOB CUDA_DLLS
-    "${_cuda_path}/bin/cudart64_*.dll"
-    "${_cuda_path}/bin/cublas64_*.dll"
-    "${_cuda_path}/bin/cublasLt64_*.dll"
-    "${_cuda_path}/bin/x64/cudart64_*.dll"
-    "${_cuda_path}/bin/x64/cublas64_*.dll"
-    "${_cuda_path}/bin/x64/cublasLt64_*.dll")
-  if(CUDA_DLLS)
-    add_custom_command(TARGET srt POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CUDA_DLLS} $<TARGET_FILE_DIR:srt>
+function(stage_runtime_dlls tgt)
+  file(GLOB _ff "${FFMPEG_DIR}/bin/*.dll")
+  if(_ff)
+    add_custom_command(TARGET ${tgt} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ff} $<TARGET_FILE_DIR:${tgt}>
       COMMAND_EXPAND_LISTS)
   endif()
-endif()
+  if(DEFINED ENV{CUDA_PATH})
+    file(TO_CMAKE_PATH "$ENV{CUDA_PATH}" _cp)
+    # CUDA 12 ships these in bin\; CUDA 13 moved them to bin\x64\.
+    file(GLOB _cu
+      "${_cp}/bin/cudart64_*.dll"     "${_cp}/bin/cublas64_*.dll"     "${_cp}/bin/cublasLt64_*.dll"
+      "${_cp}/bin/x64/cudart64_*.dll" "${_cp}/bin/x64/cublas64_*.dll" "${_cp}/bin/x64/cublasLt64_*.dll")
+    if(_cu)
+      add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_cu} $<TARGET_FILE_DIR:${tgt}>
+        COMMAND_EXPAND_LISTS)
+    endif()
+  endif()
+endfunction()
+
+stage_runtime_dlls(srt)
+stage_runtime_dlls(srtgui)

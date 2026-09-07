@@ -254,12 +254,13 @@ SRTCreator/
   CMakeLists.txt         top-level: whisper.cpp (CUDA) + ffmpeg -> srt.exe
   build.bat              MSVC/Ninja/CUDA discovery + cmake wrapper
   .gitignore
-  src/
-    main.cpp             CLI + orchestration
+  src/                   (audio+transcribe+srt+models compile into the srtcore lib)
+    main.cpp             CLI + orchestration (-> srt.exe)
     audio.{h,cpp}        FFmpeg demux/decode/resample -> f32 16k mono
-    transcribe.{h,cpp}   whisper.cpp wrapper, VAD, options
-    srt.{h,cpp}          SRT formatting / writing
+    transcribe.{h,cpp}   whisper.cpp wrapper, VAD, options, live callbacks
+    srt.{h,cpp}          SRT formatting / writing + line wrapping
     models.{h,cpp}       model resolution + download
+    gui/main_gui.cpp     Win32 drag-and-drop GUI (-> srtgui.exe)
   third_party/
     whisper.cpp/         vendored submodule (committed)
     ffmpeg/              dev/shared libs: include\ lib\ bin\ (git-ignored, local)
@@ -325,3 +326,22 @@ SRTCreator/
   file and the README.
 - Benchmark speed claims with an actual realtime factor on a real movie before
   asserting them.
+
+## 11. GUI (`srtgui.exe`, `gui` branch)
+
+Minimal Win32 drag-and-drop front end over the shared `srtcore` library. Drop a
+file -> worker thread runs `audio::decode` + `transcribe::run` + `srt::write`;
+subtitles stream into a read-only EDIT panel with a progress bar. All CLI toggles
+are checkboxes (Translate/VAD/Flash/Word-timestamps/Wrap) plus Model + Language
+dropdowns.
+
+- Live updates use `transcribe::Options.on_segment` / `on_progress`, which wrap
+  whisper's `new_segment_callback` / `progress_callback`. These fire on the worker
+  thread and are marshaled to the UI thread via `PostMessage` (`WM_APP_*`).
+- `on_segment` is display-only; `transcribe::run` still fills the segment vector
+  used for the file (don't push in both or lines double).
+- No separate manifest: comctl6 + visual styles via a `#pragma comment(linker,...)`
+  manifestdependency; `SetProcessDPIAware()` at startup.
+- Known rough edge: model download uses `curl` via `std::system`, which flashes a
+  console window from the GUI. Fix later with `CreateProcess` + `CREATE_NO_WINDOW`
+  (or an in-process HTTP download).

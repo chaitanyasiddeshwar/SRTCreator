@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <string>
 #include <vector>
 #include "srt.h"
@@ -15,6 +16,12 @@ struct Options {
     int  threads = 0;                   // 0 = auto
     bool word_timestamps = false;
     bool verbose = false;
+
+    // Optional live callbacks (used by the GUI; left null by the CLI).
+    // on_segment fires as each new segment is decoded; on_progress reports 0-100.
+    // Both fire on the worker/whisper thread - marshal to your UI thread.
+    std::function<void(const srt::Segment&)> on_segment;
+    std::function<void(int)>                 on_progress;
 };
 
 // Transcribe mono 16 kHz float PCM into timestamped segments.
