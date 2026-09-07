@@ -324,6 +324,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
     ShowWindow(hwnd, nShow);
     UpdateWindow(hwnd);
 
+    // Optional: a file passed on the command line (e.g. "Open with…") starts
+    // immediately, using the current default toggle states.
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            if (argc >= 2 && GetFileAttributesW(argv[1]) != INVALID_FILE_ATTRIBUTES)
+                start_job(hwnd, argv[1]);
+            LocalFree(argv);
+        }
+    }
+
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0)) {
         TranslateMessage(&m);
