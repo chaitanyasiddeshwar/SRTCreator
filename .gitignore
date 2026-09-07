@@ -1,0 +1,23 @@
+# Build output
+/build/
+/out/
+/dist/
+
+# Downloaded models (large; fetched on demand)
+/models/
+*.bin
+*.gguf
+
+# Vendored FFmpeg dev/shared libs (provided locally, not committed)
+/third_party/ffmpeg/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.user
+Thumbs.db
+Desktop.ini
+
+# Local scratch
+*.log
+*.srt

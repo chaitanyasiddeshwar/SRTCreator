@@ -112,62 +112,66 @@ transcribe a 2-hour movie well under realtime.
 
 ## 4. Build
 
-Toolchain required:
-
-- **Visual Studio Build Tools** (MSVC) + **CMake** (>= 3.21)
-- **CUDA Toolkit** (>= 12.x) — provides `nvcc`, cuBLAS; needed to compile the
-  ggml-cuda backend
-- **MSYS2** — required to run FFmpeg's `configure` even when targeting MSVC
-- Vendored sources: `third_party/whisper.cpp`, `third_party/ffmpeg`
-
-### 4.1 Minimized static FFmpeg (audio-only)
-
-Build once, from an MSYS2 shell with the MSVC environment loaded. The point is to
-compile only the audio demuxers/decoders + resampler as **static** libs. Adjust
-the enabled demuxers/decoders to taste, but keep the common movie audio codecs.
-
-```sh
-./configure \
-  --toolchain=msvc \
-  --disable-everything --disable-programs --disable-doc \
-  --enable-static --disable-shared \
-  --enable-protocol=file \
-  --enable-demuxer=matroska,mov,mpegts,avi,flv,ogg,wav,mp3,flac,aac,ac3,dts \
-  --enable-decoder=aac,aac_latm,ac3,eac3,dca,truehd,mlp,mp3,mp2,opus,vorbis,flac,pcm_s16le,pcm_s24le,pcm_f32le,alac,wmav1,wmav2 \
-  --enable-parser=aac,ac3,dca,flac,mpegaudio,opus,vorbis \
-  --enable-filter=aresample \
-  --disable-encoders --disable-muxers --disable-bsfs \
-  --disable-network --disable-avdevice --disable-postproc --disable-swscale \
-  --prefix=../ffmpeg-min
-make -j && make install
-```
-
-Produces static `libavformat`, `libavcodec`, `libavutil`, `libswresample` under
-`ffmpeg-min/`. These are linked into `srt.exe`.
-
-> Licensing: FFmpeg core is LGPL-2.1+. Keeping to audio decode/demux avoids GPL
-> components. Static-linking LGPL code requires providing the means to relink
-> (object files) if the exe is distributed. Document this if we ever ship it.
-
-### 4.2 whisper.cpp with CUDA
-
-Built as part of our CMake project (or prebuilt static libs), with:
+The top-level `CMakeLists.txt` `add_subdirectory()`s vendored whisper.cpp with
+`GGML_CUDA=ON` and links the `whisper` target (which pulls in ggml / ggml-cuda /
+cudart / cublas transitively) plus the FFmpeg audio libs into `srt.exe`.
+`build.bat` is a thin wrapper: it discovers MSVC (vswhere → VsDevCmd, Axiom-style),
+puts CUDA and Ninja on PATH, and runs CMake.
 
 ```
--DGGML_CUDA=ON
+build.bat            # configure + build (Release) -> build\srt.exe
+build.bat clean      # wipe build\ and rebuild
 ```
 
-Ensure flash-attn kernels are compiled (default in recent ggml-cuda).
+Toolchain on this machine (verified):
 
-### 4.3 App CMake
+- **VS 2022 Build Tools** (MSVC x64). VS 2019 is also installed; `vswhere -latest`
+  correctly selects 2022, which CUDA 13 requires.
+- **CMake 4.1** and **Ninja** (bundled under
+  `<VS>\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja`).
+- **CUDA Toolkit 13.0** (`CUDA_PATH` → `...\CUDA\v13.0`).
 
-One `CMakeLists.txt` that:
+### 4.1 Generator: use Ninja, not the Visual Studio generator
 
-- adds whisper.cpp + ggml (CUDA) as static targets
-- imports the minimized FFmpeg static libs from `ffmpeg-min/`
-- builds `src/main.cpp` + glue into `srt.exe`
-- links: whisper, ggml, ggml-cuda, cudart, cublas, cublasLt, avformat,
-  avcodec, avutil, swresample, plus Windows/CRT libs
+The VS generator needs CUDA's MSBuild integration (`.props/.targets`) copied into
+the VS install; here it is **not** installed (CUDA was installed before/without VS
+integration), so the VS generator fails with **"No CUDA toolset found."** Ninja
+invokes `nvcc` directly and sidesteps this entirely. `build.bat` forces `-G Ninja`
+and prepends the bundled Ninja to PATH. **Do not switch back to the VS generator**
+unless the CUDA MSBuild integration is installed.
+
+> Automation note: driving the build by invoking `cmd` non-interactively mangles
+> output because **Clink** (a cmd AutoRun add-on) is installed. For scripted
+> builds, drive CMake from PowerShell via `Enter-VsDevShell` (see
+> `scripts` / dev notes), which Clink does not hook. `build.bat` run normally by
+> the user is unaffected.
+
+### 4.2 whisper.cpp (vendored, CUDA)
+
+Git submodule at `third_party/whisper.cpp` (pinned; `git submodule update --init
+--recursive`). Built with `GGML_CUDA=ON`, `BUILD_SHARED_LIBS=OFF`,
+`CMAKE_CUDA_ARCHITECTURES=86` (Ampere / 3080 Ti). Flash-attn kernels are compiled
+by default. API in use (commit 52a939a2): `whisper_context_params.{use_gpu,
+flash_attn,gpu_device}`, `whisper_full_params.{language,detect_language,translate,
+token_timestamps,vad,vad_model_path,vad_params}`.
+
+### 4.3 FFmpeg audio libraries
+
+**Bootstrap (current):** prebuilt **BtbN LGPL shared** dev libs staged at
+`third_party/ffmpeg/{include,lib,bin}` (git-ignored, provided locally). CMake
+links `avformat/avcodec/avutil/swresample` import libs and copies the DLLs next to
+the exe. This is LGPL (audio-only, no GPL components) and matches our licensing
+goal.
+
+**Optimization (later):** `scripts/build-ffmpeg.sh` builds a minimized, static,
+audio-only FFmpeg via MSYS2 (`--disable-everything` + explicit audio
+demuxers/decoders + `aresample`). Point `FFMPEG_DIR`/`third_party/ffmpeg` at its
+output to fold the audio path into the exe. **MSYS2 is not yet installed** — this
+is a deferred step, not required for first light.
+
+> Licensing: FFmpeg audio decode/demux is LGPL-2.1+. Static-linking LGPL requires
+> providing the means to relink if the exe is distributed. Moot for personal use;
+> document if we ever ship.
 
 ---
 
@@ -188,12 +192,14 @@ Common options:
   -l, --language <code>   Source language (e.g. en, es). Default: auto
       --translate         Translate to English instead of transcribing
       --audio-stream <n>  Pick a specific audio stream index (default: best)
+      --duration <sec>    Only transcribe the first <sec> seconds (testing/preview)
 
 Speed / quality:
       --flash-attn        Flash attention (default: ON; --no-flash-attn to off)
       --vad               Silero VAD to skip non-speech (default: ON)
       --threads <N>       CPU threads for pre/post (default: auto)
       --word-timestamps   Emit word-level timing (tighter sync, slower)
+      --max-line-length   Wrap subtitles to N chars/line (default 42; 0=off)
 
 Model management:
       --models-dir <path> Where models are stored/downloaded
@@ -244,7 +250,10 @@ Runtime requirements for the end user:
 ```
 SRTCreator/
   CLAUDE.md              (this file)
-  CMakeLists.txt
+  README.md
+  CMakeLists.txt         top-level: whisper.cpp (CUDA) + ffmpeg -> srt.exe
+  build.bat              MSVC/Ninja/CUDA discovery + cmake wrapper
+  .gitignore
   src/
     main.cpp             CLI + orchestration
     audio.{h,cpp}        FFmpeg demux/decode/resample -> f32 16k mono
@@ -252,18 +261,29 @@ SRTCreator/
     srt.{h,cpp}          SRT formatting / writing
     models.{h,cpp}       model resolution + download
   third_party/
-    whisper.cpp/         vendored
-    ffmpeg/              vendored source (for the minimized build)
-  ffmpeg-min/            build output: minimized static libs + headers
-  models/                downloaded models (gitignored)
+    whisper.cpp/         vendored submodule (committed)
+    ffmpeg/              dev/shared libs: include\ lib\ bin\ (git-ignored, local)
+  build/                 cmake/ninja output incl. srt.exe + staged DLLs (ignored)
+  models/                downloaded models (gitignored; real store is %LOCALAPPDATA%)
   scripts/
-    build-ffmpeg.sh      the §4.1 minimized build
+    build-ffmpeg.sh      minimized static build (§4.3, later)
     fetch-models.ps1
 ```
 
 ---
 
 ## 8. Implementation milestones
+
+**Status (verified 2026-09-07):** Milestones 1–6 are DONE and working end-to-end.
+`srt.exe` builds (Ninja + CUDA 13), and transcribed a real UHD file
+(`Transformers.One` — E-AC3 7.1 → mono → VAD → whisper) at **~70× realtime**
+(10 min of audio in 8.6 s) with accurate text and timestamps. Remaining: milestone
+7 polish + the minimized-static FFmpeg optimization (§4.3).
+
+> **Gotcha (do not regress):** for auto language, set `whisper_full_params.language
+> = "auto"` and leave `detect_language = false`. `detect_language = true` is a
+> *detect-only* mode that returns zero segments — it silently produces empty SRTs.
+> See `src/transcribe.cpp`.
 
 1. **Skeleton + CLI** — arg parsing, resolve input/output paths.
 2. **FFmpeg audio path** — `build-ffmpeg.sh`, then `audio.cpp`: open any file,
