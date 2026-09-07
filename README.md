@@ -54,8 +54,13 @@ transcribes, shows the subtitles live in a panel with a progress bar, and saves
 `<input>.srt` next to the file. All the main options are checkboxes/dropdowns:
 
 - Checkboxes: **Translate → English**, **VAD**, **Flash attention**,
-  **Word timestamps**, **Wrap lines (42)**
-- Dropdowns: **Model** and **Language**
+  **Word timestamps**, **Wrap lines (42)**, **Center channel (dialogue)**,
+  **Isolate vocals (remove music)**
+- Dropdowns: **Model**, **Language**, and **Vocal** (separation model)
+
+> **Vocal isolation** (optional) removes music/effects before transcribing, which
+> helps dialogue buried under a score. It's GPU-accelerated but adds a few minutes
+> and is best for music-heavy content; plain transcription is the fast default.
 
 No console needed — just double-click `srtgui.exe`. (First run may briefly show a
 console window while a model downloads.)
@@ -80,6 +85,9 @@ srt <input> [options]
 | `--duration <sec>` | whole file | Only transcribe the first `<sec>` seconds. Handy for a quick preview/test. |
 | `--max-line-length <n>` | `42` | Wrap subtitle text to at most `n` characters per line (balanced across two lines when it fits). `0` disables wrapping. |
 | `--no-vad` | VAD on | Disable Voice Activity Detection. VAD skips non-speech and is recommended; disable only to debug. |
+| `--no-center` | center on | Don't isolate the Front-Center channel. By default, for 5.1/7.1 sources the center channel (dialogue) is used instead of a full downmix. |
+| `--isolate-vocals` | off | Remove music/effects with a separation model (MDX-Net, GPU) before transcribing. Helps dialogue over score; slower (~minutes) and off by default. |
+| `--vocal-model <name>` | Kim_Vocal_2 | Separation model: `Kim_Vocal_2`, `UVR-MDX-NET-Inst_HQ_3`, `UVR_MDXNET_KARA_2`. |
 | `--no-flash-attn` | flash on | Disable flash attention (rarely needed). |
 | `--word-timestamps` | off | Compute word-level timestamps (tighter sync, slightly slower). |
 | `--threads <n>` | auto | CPU worker threads for pre/post-processing. |

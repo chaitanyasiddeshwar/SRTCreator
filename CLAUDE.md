@@ -342,6 +342,39 @@ dropdowns.
   used for the file (don't push in both or lines double).
 - No separate manifest: comctl6 + visual styles via a `#pragma comment(linker,...)`
   manifestdependency; `SetProcessDPIAware()` at startup.
-- Known rough edge: model download uses `curl` via `std::system`, which flashes a
-  console window from the GUI. Fix later with `CreateProcess` + `CREATE_NO_WINDOW`
-  (or an in-process HTTP download).
+- Model downloads are in-process (`URLDownloadToFile`, no console) with progress.
+
+## 12. Vocal isolation (`separate.{h,cpp}`, optional)
+
+Optional music-removal stage before whisper, to recover dialogue under score.
+
+- **Engine:** MDX-Net ONNX models (UVR), run on the GPU via **ONNX Runtime
+  DirectML** (chosen over the CUDA EP to avoid CUDA/cuDNN version coupling with
+  our CUDA-13 whisper). STFT/iSTFT via pocketfft; UVR-style chunked overlap/trim.
+- **Models:** registry in `separate.cpp` (Kim_Vocal_2 default, Inst_HQ_3, KARA_2)
+  with per-model params from UVR's model_data.json + download URLs. Local copies
+  live in `%LOCALAPPDATA%\SRTCreator\models`.
+- **Pipeline when enabled:** decode 44.1k stereo -> MDX separate -> vocals ->
+  resample to 16k mono -> whisper. Whisper's VAD is bypassed when isolating
+  (music already gone; its long-segment remapping only hurt).
+- **Flags/UI:** CLI `--isolate-vocals [--vocal-model <name>]`; GUI checkbox +
+  "Vocal:" dropdown. **Off by default.**
+- **Deps:** `third_party/onnxruntime` (DirectML build, provided locally,
+  git-ignored) + `third_party/pocketfft_hdronly.h`. `NOMINMAX` before `windows.h`
+  (else `max` macro breaks pocketfft/std).
+
+> **Findings (Tron.Ares vs its official embedded subtitle, word-level recall):**
+> plain VAD scored ~71% recall / 97% precision and is fast (~70s); vocal
+> isolation was near-perfect on the narration-heavy opening (~90%) but on the
+> full action film scored ~63% recall with more hallucination (residual score in
+> loud scenes) and ~7 min runtime. So VAD remains the default; isolation is an
+> opt-in that helps dialogue-over-music but is not yet a universal win. Possible
+> improvements: verify the MDX STFT/iSTFT against UVR bit-for-bit, try the
+> instrumental model (vocals = mix - inst), or add an energy/Silero VAD on the
+> isolated stem to drop instrumental gaps before whisper.
+
+## 13. srt::write
+
+Wraps text (default 42 chars/line, balanced) and **collapses consecutive
+duplicate cues** - important because whisper loops the same line over ambiguous
+audio (seen ~1200x on one film); dropping repeats keeps the SRT clean.
