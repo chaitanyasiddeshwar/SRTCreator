@@ -103,6 +103,12 @@ bool decode(const std::string& path, const DecodeOptions& opts,
     const size_t limit_samples = opts.max_seconds > 0.0
         ? (size_t)(opts.max_seconds * opts.sample_rate) : 0;
 
+    // Total seconds for progress: the limit if set, else the container duration.
+    double total_sec = 0.0;
+    if (opts.max_seconds > 0.0) total_sec = opts.max_seconds;
+    else if (fmt->duration != AV_NOPTS_VALUE) total_sec = (double)fmt->duration / AV_TIME_BASE;
+    int last_pct = -1;
+
     while (ok && av_read_frame(fmt, pkt) >= 0) {
         if (pkt->stream_index == stream_index) {
             if (avcodec_send_packet(ctx, pkt) >= 0) {
@@ -112,6 +118,13 @@ bool decode(const std::string& path, const DecodeOptions& opts,
             }
         }
         av_packet_unref(pkt);
+
+        if (opts.on_progress && total_sec > 0.0) {
+            double done = (double)out_pcm.size() / opts.sample_rate;
+            int pct = (int)(done / total_sec * 100.0);
+            if (pct > 100) pct = 100;
+            if (pct != last_pct) { last_pct = pct; opts.on_progress(pct); }
+        }
         if (limit_samples && out_pcm.size() >= limit_samples) break;
     }
 

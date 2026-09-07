@@ -50,6 +50,7 @@ add_library(srtcore STATIC
   src/transcribe.cpp
   src/srt.cpp
   src/models.cpp
+  src/log.cpp
 )
 target_include_directories(srtcore PUBLIC
   "${CMAKE_SOURCE_DIR}/src"
@@ -66,6 +67,15 @@ target_link_libraries(srt PRIVATE srtcore)
 
 add_executable(srtgui WIN32 src/gui/main_gui.cpp)
 target_link_libraries(srtgui PRIVATE srtcore comctl32)
+
+# MSVC: compile our sources as UTF-8 (so labels like -> and ... are correct),
+# emit debug info even in Release, and link dbghelp for crash backtraces.
+if(MSVC)
+  target_compile_options(srtcore PUBLIC /utf-8 /Zi)
+  target_link_libraries(srtcore PUBLIC dbghelp)
+  target_link_options(srt    PRIVATE /DEBUG)
+  target_link_options(srtgui PRIVATE /DEBUG)
+endif()
 
 # ---------------------------------------------------------------------------
 # Stage runtime DLLs (FFmpeg + CUDA) next to each exe so they run from build\.

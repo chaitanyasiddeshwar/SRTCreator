@@ -12,6 +12,8 @@
 #include <shellapi.h>
 
 #include <atomic>
+#include <cstdlib>
+#include <exception>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,6 +22,7 @@
 #include "transcribe.h"
 #include "srt.h"
 #include "models.h"
+#include "log.h"
 
 // Enable visual styles (themed common controls v6).
 #pragma comment(linker, "\"/manifestdependency:type='win32' \
@@ -41,7 +44,7 @@ enum {
 };
 
 static HWND g_status, g_translate, g_vad, g_flash, g_wordts, g_wrap;
-static HWND g_model, g_lang, g_edit, g_progress;
+static HWND g_model, g_lang, g_model_lbl, g_lang_lbl, g_edit, g_progress;
 static std::atomic<bool> g_running{false};
 
 // ---- utf8 <-> wide ----
@@ -87,10 +90,19 @@ struct Job {
     int max_line_length;
 };
 
-static void run_job(Job job) {
+static std::wstring basename_of(const std::wstring& p) {
+    size_t s = p.find_last_of(L"/\\");
+    return s == std::wstring::npos ? p : p.substr(s + 1);
+}
+
+static void do_job(Job job) {
     HWND hwnd = job.hwnd;
     std::string input = to_utf8(job.input);
     std::string err;
+
+    logging::logf("INFO", "job start: input=%s model=%s lang=%s translate=%d vad=%d wrap=%d",
+                  input.c_str(), job.model.c_str(), job.language.c_str(),
+                  (int)job.translate, (int)job.vad, job.max_line_length);
 
     std::string models_dir = models::default_models_dir();
 
@@ -99,6 +111,7 @@ static void run_job(Job job) {
 
     std::string model_path;
     if (!models::resolve(job.model, models_dir, true, model_path, err)) {
+        logging::error("model resolve failed: " + err);
         PostMessageW(hwnd, WM_APP_MARQUEE, 0, 0);
         post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
         return;
@@ -107,21 +120,28 @@ static void run_job(Job job) {
     std::string vad_path;
     bool vad = job.vad;
     if (vad && !models::ensure_vad(models_dir, true, vad_path, err)) {
-        vad = false; // continue without VAD
-    }
-
-    post_str(hwnd, WM_APP_STATUS, 0, L"Decoding audio…");
-    std::vector<float> pcm;
-    audio::DecodeOptions dopts;
-    if (!audio::decode(input, dopts, pcm, err)) {
-        PostMessageW(hwnd, WM_APP_MARQUEE, 0, 0);
-        post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
-        return;
+        logging::error("VAD model unavailable, continuing without VAD: " + err);
+        vad = false;
     }
 
     PostMessageW(hwnd, WM_APP_MARQUEE, 0, 0);
     PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0);
+    post_str(hwnd, WM_APP_STATUS, 0, L"Decoding audio… (can take a while for long files)");
+    logging::info("decoding audio");
+
+    std::vector<float> pcm;
+    audio::DecodeOptions dopts;
+    dopts.on_progress = [hwnd](int pct) { PostMessageW(hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0); };
+    if (!audio::decode(input, dopts, pcm, err)) {
+        logging::error("decode failed: " + err);
+        post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
+        return;
+    }
+    logging::logf("INFO", "decoded %.1f min (%zu samples)", pcm.size() / 16000.0 / 60.0, pcm.size());
+
+    PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0);
     post_str(hwnd, WM_APP_STATUS, 0, L"Transcribing…");
+    logging::info("transcribing");
 
     std::vector<srt::Segment> segments;
     transcribe::Options t;
@@ -142,9 +162,11 @@ static void run_job(Job job) {
     };
 
     if (!transcribe::run(pcm, t, segments, err)) {
+        logging::error("transcribe failed: " + err);
         post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
         return;
     }
+    logging::logf("INFO", "transcribed %zu segments", segments.size());
 
     // Output path: <input>.srt (extension replaced).
     std::wstring out = job.input;
@@ -153,16 +175,47 @@ static void run_job(Job job) {
     out = (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash))
               ? out + L".srt" : out.substr(0, dot) + L".srt";
 
-    if (!srt::write(segments, to_utf8(out), job.max_line_length, err)) {
-        post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
+    if (srt::write(segments, to_utf8(out), job.max_line_length, err)) {
+        PostMessageW(hwnd, WM_APP_PROGRESS, 100, 0);
+        logging::info("wrote " + to_utf8(out));
+        post_str(hwnd, WM_APP_DONE, 1, L"Saved: " + out);
         return;
     }
-    PostMessageW(hwnd, WM_APP_PROGRESS, 100, 0);
-    post_str(hwnd, WM_APP_DONE, 1, L"Saved: " + out);
+
+    // Primary location not writable (e.g. a read-only media share): fall back to
+    // the Desktop so the user always gets output.
+    logging::error("write failed at " + to_utf8(out) + ": " + err);
+    const char* up = std::getenv("USERPROFILE");
+    if (up && *up) {
+        std::wstring fb = to_wide(std::string(up)) + L"\\Desktop\\" + basename_of(out);
+        std::string ferr;
+        if (srt::write(segments, to_utf8(fb), job.max_line_length, ferr)) {
+            PostMessageW(hwnd, WM_APP_PROGRESS, 100, 0);
+            logging::info("wrote fallback " + to_utf8(fb));
+            post_str(hwnd, WM_APP_DONE, 1, L"Source folder not writable. Saved to Desktop: " + fb);
+            return;
+        }
+        logging::error("fallback write failed: " + ferr);
+    }
+    post_str(hwnd, WM_APP_DONE, 0, L"Error writing SRT: " + to_wide(err));
+}
+
+static void run_job(Job job) {
+    HWND hwnd = job.hwnd;
+    try {
+        do_job(job);
+    } catch (const std::exception& e) {
+        logging::error(std::string("exception: ") + e.what());
+        post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(e.what()));
+    } catch (...) {
+        logging::error("unknown exception in worker");
+        post_str(hwnd, WM_APP_DONE, 0, L"Error: unknown failure (see log)");
+    }
 }
 
 static void start_job(HWND hwnd, const std::wstring& path) {
     if (g_running.exchange(true)) return; // one at a time
+    logging::info("file dropped: " + to_utf8(path));
     SetWindowTextW(g_edit, L"");
 
     Job job;
@@ -182,21 +235,24 @@ static void start_job(HWND hwnd, const std::wstring& path) {
 // ---- layout ----
 static void layout(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
-    int W = rc.right, H = rc.bottom, m = 10;
+    int W = rc.right, H = rc.bottom, m = 12;
     MoveWindow(g_status, m, m, W - 2 * m, 20, TRUE);
 
-    int y = m + 26, x = m;
+    int y = m + 30, x = m;
     struct { HWND h; int w; } cbs[] = {
-        {g_translate, 150}, {g_vad, 70}, {g_flash, 110}, {g_wordts, 150}, {g_wrap, 130}
+        {g_translate, 165}, {g_vad, 70}, {g_flash, 140}, {g_wordts, 155}, {g_wrap, 145}
     };
-    for (auto& c : cbs) { MoveWindow(c.h, x, y, c.w, 22, TRUE); x += c.w; }
+    for (auto& c : cbs) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 12; }
 
-    y += 28;
-    MoveWindow(g_model, m + 50, y, 220, 200, TRUE);
-    MoveWindow(g_lang,  m + 50 + 220 + 60, y, 120, 200, TRUE);
+    y += 34;
+    MoveWindow(g_model_lbl, m,           y + 4, 45, 18, TRUE);
+    MoveWindow(g_model,     m + 50,      y, 230, 300, TRUE);
+    int lx = m + 50 + 230 + 24;
+    MoveWindow(g_lang_lbl,  lx,          y + 4, 42, 18, TRUE);
+    MoveWindow(g_lang,      lx + 46,     y, 130, 300, TRUE);
 
-    int top = y + 32;
-    int prog_h = 20;
+    int top = y + 36;
+    int prog_h = 22;
     MoveWindow(g_edit, m, top, W - 2 * m, H - top - prog_h - 2 * m, TRUE);
     MoveWindow(g_progress, m, H - prog_h - m, W - 2 * m, prog_h, TRUE);
 }
@@ -219,7 +275,7 @@ static void create_controls(HWND hwnd) {
     SendMessageW(g_flash, BM_SETCHECK, BST_CHECKED, 0);
     SendMessageW(g_wrap,  BM_SETCHECK, BST_CHECKED, 0);
 
-    mk(hwnd, L"STATIC", L"Model:", SS_LEFT, 0);
+    g_model_lbl = mk(hwnd, L"STATIC", L"Model:", SS_LEFT, 0);
     g_model = mk(hwnd, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_MODEL);
     const wchar_t* models_[] = { L"large-v3-turbo-q8_0", L"large-v3-turbo", L"large-v3",
                                  L"medium", L"small", L"base", L"tiny",
@@ -227,7 +283,7 @@ static void create_controls(HWND hwnd) {
     for (auto s : models_) SendMessageW(g_model, CB_ADDSTRING, 0, (LPARAM)s);
     SendMessageW(g_model, CB_SETCURSEL, 0, 0);
 
-    mk(hwnd, L"STATIC", L"Lang:", SS_LEFT, 0);
+    g_lang_lbl = mk(hwnd, L"STATIC", L"Lang:", SS_LEFT, 0);
     g_lang = mk(hwnd, L"COMBOBOX", L"", CBS_DROPDOWN | WS_VSCROLL, ID_LANG);
     const wchar_t* langs[] = { L"auto", L"en", L"es", L"fr", L"de", L"it", L"pt",
                                L"nl", L"ru", L"zh", L"ja", L"ko", L"hi", L"ar" };
@@ -236,12 +292,13 @@ static void create_controls(HWND hwnd) {
 
     g_edit = mk(hwnd, L"EDIT", L"",
                 ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER, ID_EDIT);
+    SendMessageW(g_edit, EM_SETLIMITTEXT, 0, 0); // lift the default ~64 KB cap
     g_progress = mk(hwnd, PROGRESS_CLASSW, L"", 0, ID_PROGRESS);
     SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
 
-    // A slightly larger UI font for readability.
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    for (HWND h : { g_status, g_translate, g_vad, g_flash, g_wordts, g_wrap, g_model, g_lang, g_edit })
+    for (HWND h : { g_status, g_translate, g_vad, g_flash, g_wordts, g_wrap,
+                    g_model_lbl, g_model, g_lang_lbl, g_lang, g_edit })
         SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
 }
 
@@ -307,6 +364,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
     SetProcessDPIAware();
+    logging::init("gui");
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 

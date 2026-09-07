@@ -11,6 +11,7 @@
 #include "transcribe.h"
 #include "srt.h"
 #include "models.h"
+#include "log.h"
 
 namespace {
 
@@ -64,6 +65,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
+    logging::init("cli");
 
     std::string input, output, model = kDefaultModel, language = "auto";
     std::string models_dir, download_name, threads_s, stream_s, duration_s, maxline_s;
@@ -131,17 +133,24 @@ int main(int argc, char** argv) {
         }
     }
 
+    logging::logf("INFO", "input=%s model=%s lang=%s translate=%d vad=%d wrap=%d",
+                  input.c_str(), model_path.c_str(), language.c_str(),
+                  (int)translate, (int)vad, max_line_length);
+
     // 3) Decode audio -> 16 kHz mono f32.
     std::fprintf(stderr, "[srt] decoding audio: %s\n", input.c_str());
+    logging::info("decoding audio");
     std::vector<float> pcm;
     audio::DecodeOptions dopts;
     dopts.stream_index = stream;
     dopts.max_seconds  = duration_s.empty() ? 0.0 : std::atof(duration_s.c_str());
     if (!audio::decode(input, dopts, pcm, err)) {
+        logging::error("decode failed: " + err);
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
     std::fprintf(stderr, "[srt] decoded %.1f min of audio\n", pcm.size() / 16000.0 / 60.0);
+    logging::logf("INFO", "decoded %.1f min (%zu samples)", pcm.size() / 16000.0 / 60.0, pcm.size());
 
     // 4) Transcribe.
     std::fprintf(stderr, "[srt] transcribing with %s ...\n", model_path.c_str());
@@ -156,17 +165,22 @@ int main(int argc, char** argv) {
     topts.word_timestamps = word_ts;
     topts.verbose         = verbose;
 
+    logging::info("transcribing");
     std::vector<srt::Segment> segments;
     if (!transcribe::run(pcm, topts, segments, err)) {
+        logging::error("transcribe failed: " + err);
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
+    logging::logf("INFO", "transcribed %zu segments", segments.size());
 
     // 5) Write SRT.
     if (!srt::write(segments, output, max_line_length, err)) {
+        logging::error("write failed: " + err);
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
+    logging::logf("INFO", "wrote %zu segments to %s", segments.size(), output.c_str());
     std::printf("wrote %zu segments to %s\n", segments.size(), output.c_str());
     return 0;
 }
