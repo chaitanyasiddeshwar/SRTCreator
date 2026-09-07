@@ -10,6 +10,11 @@ struct DecodeOptions {
     int stream_index  = -1;    // -1 = best audio stream
     double max_seconds = 0.0;  // 0 = whole file; else stop after N seconds (from start)
 
+    // If true and the source has a Front-Center channel (5.1/7.1), take ONLY that
+    // channel (movie dialogue lives there) instead of downmixing all channels.
+    // Auto-falls back to a normal downmix when there is no center channel.
+    bool center_channel_only = false;
+
     // Optional 0-100 progress during decode (best-effort; needs a known duration).
     std::function<void(int)> on_progress;
 };

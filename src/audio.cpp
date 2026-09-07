@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "log.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -82,14 +83,40 @@ bool decode(const std::string& path, const DecodeOptions& opts,
     AVChannelLayout out_ch;
     av_channel_layout_default(&out_ch, 1);
 
+    // Dialogue lives in the Front-Center channel of a 5.1/7.1 mix. When asked,
+    // extract ONLY that channel (via a rematrix matrix) instead of a downmix that
+    // would fold music/effects from every channel into the result.
+    int in_ch = ctx->ch_layout.nb_channels;
+    int fc_index = opts.center_channel_only
+        ? av_channel_layout_index_from_channel(&ctx->ch_layout, AV_CHAN_FRONT_CENTER)
+        : -1;
+
     SwrContext* swr = nullptr;
     int ret = swr_alloc_set_opts2(&swr,
                                   &out_ch, AV_SAMPLE_FMT_FLT, opts.sample_rate,
                                   &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate,
                                   0, nullptr);
-    if (ret < 0 || !swr || swr_init(swr) < 0) {
-        err = "failed to initialize resampler";
+    if (ret < 0 || !swr) {
+        err = "failed to allocate resampler";
         if (swr) swr_free(&swr);
+        av_channel_layout_uninit(&out_ch);
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return false;
+    }
+
+    if (fc_index >= 0) {
+        std::vector<double> matrix((size_t)in_ch, 0.0);
+        matrix[(size_t)fc_index] = 1.0; // mono out = 1.0 * Front-Center
+        swr_set_matrix(swr, matrix.data(), in_ch);
+        logging::logf("INFO", "audio: isolating center channel (index %d of %d)", fc_index, in_ch);
+    } else if (opts.center_channel_only) {
+        logging::logf("INFO", "audio: no center channel (%d ch) - downmixing to mono", in_ch);
+    }
+
+    if (swr_init(swr) < 0) {
+        err = "failed to initialize resampler";
+        swr_free(&swr);
         av_channel_layout_uninit(&out_ch);
         avcodec_free_context(&ctx);
         avformat_close_input(&fmt);

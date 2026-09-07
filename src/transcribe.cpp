@@ -64,6 +64,7 @@ bool run(const std::vector<float>& pcm, const Options& opts,
     }
     wp.token_timestamps = opts.word_timestamps;
     wp.no_context       = false;
+    wp.suppress_nst     = true; // suppress non-speech tokens (curbs music hallucinations)
 
     int threads = opts.threads;
     if (threads <= 0) {
@@ -76,6 +77,13 @@ bool run(const std::vector<float>& pcm, const Options& opts,
         wp.vad            = true;
         wp.vad_model_path = opts.vad_model_path.c_str();
         wp.vad_params     = whisper_vad_default_params();
+        // Tuned for film mixes: a lower threshold keeps dialogue that has music
+        // under it; generous padding avoids clipping word edges; a larger silence
+        // gap avoids chopping natural pauses mid-sentence.
+        wp.vad_params.threshold              = 0.35f;
+        wp.vad_params.min_silence_duration_ms = 200;
+        wp.vad_params.speech_pad_ms          = 200;
+        wp.vad_params.samples_overlap        = 0.20f;
     }
 
     if (opts.on_segment) {

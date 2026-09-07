@@ -33,6 +33,7 @@ void usage() {
         "      --duration <sec>     Only transcribe the first <sec> seconds\n"
         "      --no-flash-attn      Disable flash attention (on by default)\n"
         "      --no-vad             Disable Silero VAD (on by default)\n"
+        "      --no-center          Don't isolate the center channel (dialogue)\n"
         "      --word-timestamps    Emit word-level timing\n"
         "      --max-line-length <n> Wrap subtitles to <n> chars/line (default 42; 0=off)\n"
         "      --threads <n>        Worker threads (default: auto)\n"
@@ -70,6 +71,7 @@ int main(int argc, char** argv) {
     std::string input, output, model = kDefaultModel, language = "auto";
     std::string models_dir, download_name, threads_s, stream_s, duration_s, maxline_s;
     bool translate = false, flash = true, vad = true, word_ts = false, verbose = false;
+    bool center = true; // isolate Front-Center (dialogue) for multichannel sources
     int max_line_length = 42; // Netflix-style default; 0 disables wrapping
 
     for (int i = 1; i < argc; ++i) {
@@ -86,6 +88,8 @@ int main(int argc, char** argv) {
         else if (a == "--flash-attn")      flash = true;
         else if (a == "--no-vad")          vad = false;
         else if (a == "--vad")             vad = true;
+        else if (a == "--no-center")       center = false;
+        else if (a == "--center")          center = true;
         else if (a == "--word-timestamps") word_ts = true;
         else if (a == "--threads")         { if (!take(argc, argv, i, "--threads", threads_s)) return 2; }
         else if (a == "--models-dir")      { if (!take(argc, argv, i, "--models-dir", models_dir)) return 2; }
@@ -144,6 +148,7 @@ int main(int argc, char** argv) {
     audio::DecodeOptions dopts;
     dopts.stream_index = stream;
     dopts.max_seconds  = duration_s.empty() ? 0.0 : std::atof(duration_s.c_str());
+    dopts.center_channel_only = center;
     if (!audio::decode(input, dopts, pcm, err)) {
         logging::error("decode failed: " + err);
         std::fprintf(stderr, "error: %s\n", err.c_str());

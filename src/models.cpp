@@ -1,8 +1,14 @@
 #include "models.h"
+#include "log.h"
+
+#include <windows.h>
+#include <urlmon.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <sys/stat.h>
+
+#pragma comment(lib, "urlmon.lib")
 
 namespace models {
 
@@ -26,19 +32,69 @@ bool ends_with(const std::string& s, const std::string& suf) {
            s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
-void ensure_dir(const std::string& dir) {
-    std::string cmd = "cmd /c if not exist \"" + dir + "\" mkdir \"" + dir + "\"";
-    std::system(cmd.c_str());
+std::wstring to_wide(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
+    return w;
 }
 
-// curl.exe ships with Windows 10/11. -L follows redirects, --fail errors on 4xx/5xx.
-bool download_url(const std::string& url, const std::string& dest, std::string& err) {
+// Create each component of a directory path (mkdir -p), no console spawned.
+void ensure_dir(const std::string& dir) {
+    std::string cur;
+    for (size_t i = 0; i <= dir.size(); ++i) {
+        if (i == dir.size() || dir[i] == '\\' || dir[i] == '/') {
+            if (!cur.empty() && !(cur.size() == 2 && cur[1] == ':'))
+                CreateDirectoryA(cur.c_str(), nullptr);
+        }
+        if (i < dir.size()) cur.push_back(dir[i]);
+    }
+}
+
+// IBindStatusCallback that forwards URLDownloadToFile progress to a std::function.
+class DownloadCallback : public IBindStatusCallback {
+public:
+    explicit DownloadCallback(const Progress& cb) : cb_(cb) {}
+
+    // IUnknown (no real refcounting needed; lives on the stack for the call).
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IBindStatusCallback) { *ppv = this; return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef()  override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    HRESULT STDMETHODCALLTYPE OnStartBinding(DWORD, IBinding*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPriority(LONG*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE OnLowResource(DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnStopBinding(HRESULT, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetBindInfo(DWORD*, BINDINFO*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDataAvailable(DWORD, DWORD, FORMATETC*, STGMEDIUM*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnObjectAvailable(REFIID, IUnknown*) override { return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE OnProgress(ULONG progress, ULONG progressMax,
+                                         ULONG, LPCWSTR) override {
+        if (cb_ && progressMax) {
+            int pct = (int)((ULONGLONG)progress * 100 / progressMax);
+            if (pct != last_) { last_ = pct; cb_(pct); }
+        }
+        return S_OK;
+    }
+private:
+    Progress cb_;
+    int      last_ = -1;
+};
+
+bool download_url(const std::string& url, const std::string& dest, std::string& err,
+                  const Progress& on_progress) {
     std::string tmp = dest + ".part";
-    std::string cmd = "curl.exe -L --fail --progress-bar -o \"" + tmp + "\" \"" + url + "\"";
-    int rc = std::system(cmd.c_str());
-    if (rc != 0) {
+    DownloadCallback cb(on_progress);
+    HRESULT hr = URLDownloadToFileW(nullptr, to_wide(url).c_str(), to_wide(tmp).c_str(),
+                                    0, &cb);
+    if (FAILED(hr)) {
         std::remove(tmp.c_str());
-        err = "download failed (curl rc=" + std::to_string(rc) + "): " + url;
+        char buf[64]; std::snprintf(buf, sizeof(buf), "0x%08lx", (unsigned long)hr);
+        err = "download failed (" + std::string(buf) + "): " + url;
         return false;
     }
     std::remove(dest.c_str());
@@ -62,17 +118,18 @@ std::string filename_for(const std::string& name) {
 }
 
 bool download(const std::string& name, const std::string& models_dir,
-              std::string& out_path, std::string& err) {
+              std::string& out_path, std::string& err, const Progress& on_progress) {
     ensure_dir(models_dir);
     std::string fname = filename_for(name);
     out_path = models_dir + "\\" + fname;
     std::string url = std::string(kHfBase) + fname;
-    std::fprintf(stderr, "[models] downloading %s\n", fname.c_str());
-    return download_url(url, out_path, err);
+    logging::logf("INFO", "downloading model %s", fname.c_str());
+    return download_url(url, out_path, err, on_progress);
 }
 
 bool resolve(const std::string& spec, const std::string& models_dir,
-             bool allow_download, std::string& out_path, std::string& err) {
+             bool allow_download, std::string& out_path, std::string& err,
+             const Progress& on_progress) {
     // Explicit path or filename.
     if (has_pathsep(spec) || ends_with(spec, ".bin") || ends_with(spec, ".gguf")) {
         if (file_exists(spec)) { out_path = spec; return true; }
@@ -89,7 +146,7 @@ bool resolve(const std::string& spec, const std::string& models_dir,
               "); run once with network access or: srt --download " + spec;
         return false;
     }
-    return download(spec, models_dir, out_path, err);
+    return download(spec, models_dir, out_path, err, on_progress);
 }
 
 std::string vad_model_path(const std::string& models_dir) {
@@ -97,14 +154,14 @@ std::string vad_model_path(const std::string& models_dir) {
 }
 
 bool ensure_vad(const std::string& models_dir, bool allow_download,
-                std::string& out_path, std::string& err) {
+                std::string& out_path, std::string& err, const Progress& on_progress) {
     out_path = vad_model_path(models_dir);
     if (file_exists(out_path)) return true;
     if (!allow_download) { err = "VAD model not present: " + out_path; return false; }
     ensure_dir(models_dir);
     std::string url = std::string(kVadBase) + kVadFile;
-    std::fprintf(stderr, "[models] downloading VAD model %s\n", kVadFile);
-    return download_url(url, out_path, err);
+    logging::logf("INFO", "downloading VAD model %s", kVadFile);
+    return download_url(url, out_path, err, on_progress);
 }
 
 } // namespace models
