@@ -171,6 +171,7 @@ int main(int argc, char** argv) {
         if (!separate::isolate_vocals(mix, mpath, sp, vocals, nullptr, err)) {
             logging::error("separation failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
         }
+        std::vector<float>().swap(mix); // free the 44.1k stereo mix before resampling
         if (!audio::resample_to_mono(vocals, 44100, 1, 16000, pcm, err)) {
             logging::error("resample failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
         }

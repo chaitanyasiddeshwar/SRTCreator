@@ -157,6 +157,7 @@ static void do_job(Job job) {
             logging::error("separation failed: " + err);
             post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err)); return;
         }
+        std::vector<float>().swap(mix); // free the 44.1k stereo mix before resampling
         if (!audio::resample_to_mono(vocals, 44100, 1, 16000, pcm, err)) {
             logging::error("resample failed: " + err);
             post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err)); return;

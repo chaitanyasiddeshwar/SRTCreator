@@ -1,6 +1,8 @@
 #include "audio.h"
 #include "log.h"
 
+#include <algorithm>
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -200,29 +202,38 @@ bool resample_to_mono(const std::vector<float>& in, int in_rate, int in_channels
         return false;
     }
 
-    int in_samples = (int)(in.size() / in_channels);
-    int64_t out_max = av_rescale_rnd(swr_get_delay(swr, in_rate) + in_samples,
-                                     out_rate, in_rate, AV_ROUND_UP) + 16;
-    out.resize((size_t)out_max);
-
-    const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(in.data());
-    uint8_t* out_ptr = reinterpret_cast<uint8_t*>(out.data());
-    int got = swr_convert(swr, &out_ptr, (int)out_max, &in_ptr, in_samples);
-    int total = got > 0 ? got : 0;
-    for (;;) {
-        int rem = (int)out_max - total;
-        if (rem <= 0) break;
-        uint8_t* op = reinterpret_cast<uint8_t*>(out.data() + total);
-        int g = swr_convert(swr, &op, rem, nullptr, 0);
-        if (g <= 0) break;
-        total += g;
+    // Feed the input in blocks: a single swr_convert call with hundreds of
+    // millions of samples (e.g. a 2-hour vocal stem) does not work reliably.
+    const size_t total_in = in.size() / in_channels;
+    const size_t BLOCK = 1u << 20; // input frames per call
+    bool ok = true;
+    for (size_t pos = 0; pos < total_in; pos += BLOCK) {
+        int n = (int)std::min(BLOCK, total_in - pos);
+        int max_out = (int)av_rescale_rnd(swr_get_delay(swr, in_rate) + n,
+                                          out_rate, in_rate, AV_ROUND_UP) + 16;
+        size_t cur = out.size();
+        out.resize(cur + (size_t)max_out);
+        const uint8_t* ip = reinterpret_cast<const uint8_t*>(in.data() + pos * in_channels);
+        uint8_t* op = reinterpret_cast<uint8_t*>(out.data() + cur);
+        int got = swr_convert(swr, &op, max_out, &ip, n);
+        if (got < 0) { ok = false; out.resize(cur); break; }
+        out.resize(cur + (size_t)(got > 0 ? got : 0));
     }
-    out.resize(total > 0 ? total : 0);
+    // Flush.
+    while (ok) {
+        int max_out = (int)av_rescale_rnd(swr_get_delay(swr, in_rate), out_rate, in_rate, AV_ROUND_UP) + 16;
+        size_t cur = out.size();
+        out.resize(cur + (size_t)max_out);
+        uint8_t* op = reinterpret_cast<uint8_t*>(out.data() + cur);
+        int g = swr_convert(swr, &op, max_out, nullptr, 0);
+        out.resize(cur + (size_t)(g > 0 ? g : 0));
+        if (g <= 0) break;
+    }
 
     swr_free(&swr);
     av_channel_layout_uninit(&in_ch);
     av_channel_layout_uninit(&out_ch);
-    if (total <= 0) { err = "resample produced no output"; return false; }
+    if (!ok || out.empty()) { err = "resample produced no output"; return false; }
     return true;
 }
 
