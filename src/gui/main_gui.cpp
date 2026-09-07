@@ -20,6 +20,7 @@
 #include "transcribe.h"
 #include "srt.h"
 #include "models.h"
+#include "separate.h"
 #include "log.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' \
@@ -36,15 +37,15 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define WM_APP_DONE     (WM_APP + 5) // lParam = wchar_t* ; wParam = success
 
 enum {
-    ID_TRANSLATE = 1001, ID_VAD, ID_FLASH, ID_WORDTS, ID_WRAP, ID_CENTER,
-    ID_MODEL, ID_LANG, ID_EDIT, ID_PROGRESS, ID_STATUS,
+    ID_TRANSLATE = 1001, ID_VAD, ID_FLASH, ID_WORDTS, ID_WRAP, ID_CENTER, ID_ISOLATE,
+    ID_MODEL, ID_LANG, ID_VMODEL, ID_EDIT, ID_PROGRESS, ID_STATUS,
     ID_INPUT, ID_INPUT_BROWSE, ID_OUTPUT, ID_OUTPUT_BROWSE, ID_START
 };
 
 static HWND g_status;
 static HWND g_input_lbl, g_input, g_input_browse, g_output_lbl, g_output, g_output_browse;
-static HWND g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center;
-static HWND g_model_lbl, g_model, g_lang_lbl, g_lang, g_start;
+static HWND g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center, g_isolate;
+static HWND g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel, g_start;
 static HWND g_edit, g_progress;
 static std::atomic<bool> g_running{false};
 
@@ -92,8 +93,8 @@ static std::wstring basename_of(const std::wstring& p) {
 struct Job {
     HWND hwnd;
     std::wstring input, output;
-    std::string model, language;
-    bool translate, vad, flash, word_ts, center;
+    std::string model, language, vocal_model;
+    bool translate, vad, flash, word_ts, center, isolate;
     int max_line_length;
 };
 
@@ -129,18 +130,49 @@ static void do_job(Job job) {
     }
 
     PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0);
-    post_str(hwnd, WM_APP_STATUS, 0, L"Decoding audio… (can take a while for long files)");
-    logging::info("decoding audio");
+    auto prog = [hwnd](int pct) { PostMessageW(hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0); };
     std::vector<float> pcm;
-    audio::DecodeOptions dopts;
-    dopts.center_channel_only = job.center;
-    dopts.on_progress = [hwnd](int pct) { PostMessageW(hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0); };
-    if (!audio::decode(input, dopts, pcm, err)) {
-        logging::error("decode failed: " + err);
-        post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
-        return;
+
+    if (job.isolate) {
+        post_str(hwnd, WM_APP_STATUS, 0, L"Decoding (44.1k stereo for separation)…");
+        audio::DecodeOptions d;
+        d.sample_rate = 44100; d.channels = 2; d.center_channel_only = job.center;
+        d.on_progress = prog;
+        std::vector<float> mix;
+        if (!audio::decode(input, d, mix, err)) {
+            logging::error("decode failed: " + err);
+            post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err)); return;
+        }
+        std::string vpath; separate::Params sp;
+        post_str(hwnd, WM_APP_STATUS, 0, L"Preparing vocal model…");
+        if (!separate::ensure_model(job.vocal_model, models_dir, true, vpath, sp, err, prog)) {
+            logging::error("vocal model: " + err);
+            post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err)); return;
+        }
+        PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0);
+        post_str(hwnd, WM_APP_STATUS, 0, L"Isolating vocals (removing music)…");
+        logging::logf("INFO", "isolating vocals with %s", job.vocal_model.c_str());
+        std::vector<float> vocals;
+        if (!separate::isolate_vocals(mix, vpath, sp, vocals, prog, err)) {
+            logging::error("separation failed: " + err);
+            post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err)); return;
+        }
+        if (!audio::resample_to_mono(vocals, 44100, 1, 16000, pcm, err)) {
+            logging::error("resample failed: " + err);
+            post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err)); return;
+        }
+    } else {
+        post_str(hwnd, WM_APP_STATUS, 0, L"Decoding audio… (can take a while for long files)");
+        logging::info("decoding audio");
+        audio::DecodeOptions dopts;
+        dopts.center_channel_only = job.center;
+        dopts.on_progress = prog;
+        if (!audio::decode(input, dopts, pcm, err)) {
+            logging::error("decode failed: " + err);
+            post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err)); return;
+        }
     }
-    logging::logf("INFO", "decoded %.1f min", pcm.size() / 16000.0 / 60.0);
+    logging::logf("INFO", "audio ready %.1f min", pcm.size() / 16000.0 / 60.0);
 
     PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0);
     post_str(hwnd, WM_APP_STATUS, 0, L"Transcribing…");
@@ -219,13 +251,15 @@ static void start_job(HWND hwnd) {
 
     Job job;
     job.hwnd = hwnd; job.input = input; job.output = output;
-    job.model    = to_utf8(get_text(g_model));
-    job.language = to_utf8(get_text(g_lang));
+    job.model       = to_utf8(get_text(g_model));
+    job.language    = to_utf8(get_text(g_lang));
+    job.vocal_model = to_utf8(get_text(g_vmodel));
     job.translate = checked(g_translate);
     job.vad       = checked(g_vad);
     job.flash     = checked(g_flash);
     job.word_ts   = checked(g_wordts);
     job.center    = checked(g_center);
+    job.isolate   = checked(g_isolate);
     job.max_line_length = checked(g_wrap) ? 42 : 0;
     set_busy(true);
     std::thread(run_job, job).detach();
@@ -262,7 +296,6 @@ static void layout(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom, m = 12, bw = 80, lw = 55;
     int y = m;
-    MoveWindow(g_status, m, y, W - 2 * m, 20, TRUE); y += 26;
 
     MoveWindow(g_input_lbl, m, y + 3, lw, 18, TRUE);
     MoveWindow(g_input, m + lw, y, W - 2 * m - lw - bw - 6, 24, TRUE);
@@ -272,25 +305,37 @@ static void layout(HWND hwnd) {
     MoveWindow(g_output, m + lw, y, W - 2 * m - lw - bw - 6, 24, TRUE);
     MoveWindow(g_output_browse, W - m - bw, y, bw, 24, TRUE); y += 32;
 
+    // Checkbox row 1: transcription options.
     int x = m;
-    struct { HWND h; int w; } cbs[] = {
-        {g_translate, 160}, {g_vad, 62}, {g_flash, 135}, {g_wordts, 150},
-        {g_wrap, 120}, {g_center, 175}
+    struct { HWND h; int w; } r1[] = {
+        {g_translate, 160}, {g_vad, 62}, {g_flash, 135}, {g_wordts, 150}, {g_wrap, 130}
     };
-    for (auto& c : cbs) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 8; }
+    for (auto& c : r1) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 10; }
+    y += 28;
+    // Checkbox row 2: dialogue-audio options.
+    x = m;
+    struct { HWND h; int w; } r2[] = { {g_center, 180}, {g_isolate, 230} };
+    for (auto& c : r2) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 10; }
     y += 32;
 
+    // Model / language / vocal-model / Start.
     MoveWindow(g_model_lbl, m, y + 4, 45, 18, TRUE);
-    MoveWindow(g_model, m + 48, y, 210, 300, TRUE);
-    int lx = m + 48 + 210 + 20;
-    MoveWindow(g_lang_lbl, lx, y + 4, 40, 18, TRUE);
-    MoveWindow(g_lang, lx + 44, y, 110, 300, TRUE);
+    MoveWindow(g_model, m + 48, y, 190, 300, TRUE);
+    int lx = m + 48 + 190 + 16;
+    MoveWindow(g_lang_lbl, lx, y + 4, 38, 18, TRUE);
+    MoveWindow(g_lang, lx + 40, y, 90, 300, TRUE);
+    int vx = lx + 40 + 90 + 16;
+    MoveWindow(g_vmodel_lbl, vx, y + 4, 44, 18, TRUE);
+    MoveWindow(g_vmodel, vx + 46, y, 190, 300, TRUE);
     MoveWindow(g_start, W - m - 110, y, 110, 26, TRUE);
     y += 34;
 
-    int prog_h = 22;
-    MoveWindow(g_edit, m, y, W - 2 * m, H - y - prog_h - 2 * m, TRUE);
-    MoveWindow(g_progress, m, H - prog_h - m, W - 2 * m, prog_h, TRUE);
+    // Transcript panel, then status just above the progress bar at the bottom.
+    int prog_h = 22, status_h = 18;
+    int bottom = H - m - prog_h - 4 - status_h;
+    MoveWindow(g_edit, m, y, W - 2 * m, bottom - y, TRUE);
+    MoveWindow(g_status, m, H - m - prog_h - 4 - status_h, W - 2 * m, status_h, TRUE);
+    MoveWindow(g_progress, m, H - m - prog_h, W - 2 * m, prog_h, TRUE);
 }
 
 static HWND mk(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
@@ -314,7 +359,8 @@ static void create_controls(HWND hwnd) {
     g_flash     = mk(hwnd, L"BUTTON", L"Flash attention",     BS_AUTOCHECKBOX, ID_FLASH);
     g_wordts    = mk(hwnd, L"BUTTON", L"Word timestamps",     BS_AUTOCHECKBOX, ID_WORDTS);
     g_wrap      = mk(hwnd, L"BUTTON", L"Wrap lines (42)",     BS_AUTOCHECKBOX, ID_WRAP);
-    g_center    = mk(hwnd, L"BUTTON", L"Center chan (dialog)", BS_AUTOCHECKBOX, ID_CENTER);
+    g_center    = mk(hwnd, L"BUTTON", L"Center channel (dialogue)", BS_AUTOCHECKBOX, ID_CENTER);
+    g_isolate   = mk(hwnd, L"BUTTON", L"Isolate vocals (remove music)", BS_AUTOCHECKBOX, ID_ISOLATE);
     SendMessageW(g_vad,    BM_SETCHECK, BST_CHECKED, 0);
     SendMessageW(g_flash,  BM_SETCHECK, BST_CHECKED, 0);
     SendMessageW(g_wrap,   BM_SETCHECK, BST_CHECKED, 0);
@@ -335,6 +381,12 @@ static void create_controls(HWND hwnd) {
         SendMessageW(g_lang, CB_ADDSTRING, 0, (LPARAM)s);
     SetWindowTextW(g_lang, L"auto");
 
+    g_vmodel_lbl = mk(hwnd, L"STATIC", L"Vocal:", SS_LEFT, 0);
+    g_vmodel = mk(hwnd, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_VMODEL);
+    for (const auto& mi : separate::registry())
+        SendMessageW(g_vmodel, CB_ADDSTRING, 0, (LPARAM)to_wide(mi.name).c_str());
+    SendMessageW(g_vmodel, CB_SETCURSEL, 0, 0);
+
     g_start = mk(hwnd, L"BUTTON", L"Start", BS_DEFPUSHBUTTON, ID_START);
 
     g_edit = mk(hwnd, L"EDIT", L"",
@@ -346,13 +398,15 @@ static void create_controls(HWND hwnd) {
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     for (HWND h : { g_status, g_input_lbl, g_input, g_input_browse, g_output_lbl, g_output,
                     g_output_browse, g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center,
-                    g_model_lbl, g_model, g_lang_lbl, g_lang, g_start, g_edit })
+                    g_isolate, g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel,
+                    g_start, g_edit })
         SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
 }
 
 static void set_busy(bool busy) {
     for (HWND h : { g_start, g_input_browse, g_output_browse, g_input, g_output,
-                    g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center, g_model, g_lang })
+                    g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center, g_isolate,
+                    g_model, g_lang, g_vmodel })
         EnableWindow(h, !busy);
 }
 
@@ -420,7 +474,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
 
     HWND hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"SRTCreator",
                                 WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                                920, 660, nullptr, nullptr, hInst, nullptr);
+                                940, 700, nullptr, nullptr, hInst, nullptr);
     ShowWindow(hwnd, nShow);
     UpdateWindow(hwnd);
 
