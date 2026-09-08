@@ -13,6 +13,7 @@
 #include "models.h"
 #include "separate.h"
 #include "log.h"
+#include "debug.h"
 
 namespace {
 
@@ -37,7 +38,15 @@ void usage() {
         "      --no-center          Don't isolate the center channel (dialogue)\n"
         "      --isolate-vocals     Remove music/effects with a separation model first\n"
         "      --vocal-model <name> Vocal model: Kim_Vocal_2 (default), etc.\n"
-        "      --word-timestamps    Emit word-level timing\n"
+        "      --no-word-timestamps Disable DTW word timing (on by default; it\n"
+        "                           snaps each cue to the actual spoken words)\n"
+        "      --dump-audio [path]  Write the 16k mono audio whisper hears to a WAV\n"
+        "                           (debug; default: next to the input file)\n"
+        "      --time-offset <sec>  Shift every cue by <sec> (+later, -earlier)\n"
+        "      --debug              Write <out>.debug.txt: VAD regions vs cues vs\n"
+        "                           audio energy (diagnose early/late cue timing)\n"
+        "      --reference <srt>    Ground-truth SRT to compare timing against in\n"
+        "                           the --debug report (e.g. embedded subtitles)\n"
         "      --max-line-length <n> Wrap subtitles to <n> chars/line (default 42; 0=off)\n"
         "      --threads <n>        Worker threads (default: auto)\n"
         "      --models-dir <path>  Model store (default: %%LOCALAPPDATA%%\\SRTCreator\\models)\n"
@@ -73,11 +82,16 @@ int main(int argc, char** argv) {
 
     std::string input, output, model = kDefaultModel, language = "auto";
     std::string models_dir, download_name, threads_s, stream_s, duration_s, maxline_s;
-    bool translate = false, flash = true, vad = true, word_ts = false, verbose = false;
+    bool translate = false, flash = true, vad = true, word_ts = true, verbose = false;
     bool center = true; // isolate Front-Center (dialogue) for multichannel sources
     bool isolate = false;               // vocal isolation (music removal)
     std::string vocal_model = "Kim_Vocal_2";
     int max_line_length = 42; // Netflix-style default; 0 disables wrapping
+    bool dump_audio = false;            // write the 16k mono whisper input to a WAV
+    std::string dump_audio_path;        // explicit dump path (else auto, next to exe)
+    std::string offset_s;               // constant sync shift (seconds; +later, -earlier)
+    bool debug = false;                 // write a timing diagnostic report
+    std::string reference_path;         // optional reference SRT for the debug report
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -98,6 +112,11 @@ int main(int argc, char** argv) {
         else if (a == "--isolate-vocals" || a == "--vocals") isolate = true;
         else if (a == "--vocal-model")     { if (!take(argc, argv, i, "--vocal-model", vocal_model)) return 2; }
         else if (a == "--word-timestamps") word_ts = true;
+        else if (a == "--no-word-timestamps") word_ts = false;
+        else if (a == "--dump-audio")      { dump_audio = true; if (i + 1 < argc && argv[i+1][0] != '-') dump_audio_path = argv[++i]; }
+        else if (a == "--time-offset")     { if (!take(argc, argv, i, "--time-offset", offset_s)) return 2; }
+        else if (a == "--debug")           debug = true;
+        else if (a == "--reference")       { if (!take(argc, argv, i, "--reference", reference_path)) return 2; }
         else if (a == "--threads")         { if (!take(argc, argv, i, "--threads", threads_s)) return 2; }
         else if (a == "--models-dir")      { if (!take(argc, argv, i, "--models-dir", models_dir)) return 2; }
         else if (a == "--download")        { if (!take(argc, argv, i, "--download", download_name)) return 2; }
@@ -135,9 +154,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Vocal isolation removes music, so whisper's VAD is unnecessary and its
-    // long-segment remapping hurts; skip it when isolating.
-    if (isolate) vad = false;
+    // Note: VAD stays ON even when isolating. It was once disabled here (music is
+    // gone after separation), but without VAD whisper back-dates segment starts
+    // across silence gaps (cues appear seconds early) and falls into repetition
+    // loops on isolated-stem artifacts. Running Silero VAD on the isolated stem
+    // fixes both - it trims the leading silence so timing tracks the real onset.
 
     // 2) VAD model (optional; disable gracefully if unavailable).
     std::string vad_path;
@@ -191,6 +212,27 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[srt] audio ready: %.1f min\n", pcm.size() / 16000.0 / 60.0);
     logging::logf("INFO", "audio ready %.1f min (%zu samples)", pcm.size() / 16000.0 / 60.0, pcm.size());
 
+    // Optional: dump the exact 16 kHz mono audio whisper will hear (the isolated
+    // vocal stem when --isolate-vocals). ONLY when --dump-audio is given - we never
+    // need this file internally, so isolating alone must not leave one behind.
+    // Default location is next to the input.
+    if (dump_audio) {
+        std::string wav = dump_audio_path;
+        if (wav.empty()) {
+            size_t dot = input.find_last_of('.');
+            std::string base = (dot == std::string::npos) ? input : input.substr(0, dot);
+            wav = base + (isolate ? ".vocals16k.wav" : ".whisper16k.wav");
+        }
+        std::string werr;
+        if (audio::write_wav(wav, pcm, 16000, 1, werr)) {
+            std::fprintf(stderr, "[srt] wrote debug audio: %s\n", wav.c_str());
+            logging::logf("INFO", "dumped whisper input audio to %s", wav.c_str());
+        } else {
+            std::fprintf(stderr, "warning: could not write debug audio (%s)\n", werr.c_str());
+            logging::error("audio dump failed: " + werr);
+        }
+    }
+
     // 4) Transcribe.
     std::fprintf(stderr, "[srt] transcribing with %s ...\n", model_path.c_str());
     transcribe::Options topts;
@@ -203,6 +245,8 @@ int main(int argc, char** argv) {
     topts.threads         = threads;
     topts.word_timestamps = word_ts;
     topts.verbose         = verbose;
+    std::vector<transcribe::VadRegion> vad_regions;
+    if (debug) topts.vad_regions = &vad_regions;
 
     logging::info("transcribing");
     std::vector<srt::Segment> segments;
@@ -213,6 +257,18 @@ int main(int argc, char** argv) {
     }
     logging::logf("INFO", "transcribed %zu segments", segments.size());
 
+    // Optional constant sync shift. Whisper's segment timestamps can lead or lag
+    // the true audio (typically ~0.4s in the VAD path); this lets the user nudge
+    // every cue by a fixed amount. Positive = later, negative = earlier.
+    double time_offset = offset_s.empty() ? 0.0 : std::atof(offset_s.c_str());
+    if (time_offset != 0.0) {
+        for (auto& s : segments) {
+            s.t0 += time_offset; if (s.t0 < 0.0) s.t0 = 0.0;
+            s.t1 += time_offset; if (s.t1 < 0.0) s.t1 = 0.0;
+        }
+        logging::logf("INFO", "applied time offset %.3f s", time_offset);
+    }
+
     // 5) Write SRT.
     if (!srt::write(segments, output, max_line_length, err)) {
         logging::error("write failed: " + err);
@@ -221,5 +277,28 @@ int main(int argc, char** argv) {
     }
     logging::logf("INFO", "wrote %zu segments to %s", segments.size(), output.c_str());
     std::printf("wrote %zu segments to %s\n", segments.size(), output.c_str());
+
+    // 6) Optional timing diagnostics (--debug): correlate VAD regions, whisper
+    // cues, actual audio energy, and an optional reference SRT.
+    if (debug) {
+        std::vector<srt::Segment> ref;
+        const std::vector<srt::Segment>* refp = nullptr;
+        if (!reference_path.empty()) {
+            std::string rerr;
+            if (srt::read(reference_path, ref, rerr) && !ref.empty()) refp = &ref;
+            else std::fprintf(stderr, "warning: could not use reference %s (%s)\n",
+                              reference_path.c_str(), rerr.c_str());
+        }
+        debugreport::Info di;
+        di.model = model; di.isolate = isolate; di.center = center; di.vad = vad; di.word_ts = word_ts;
+        std::string dbg_path = output + ".debug.txt";
+        std::string derr;
+        if (debugreport::write(dbg_path, pcm, segments, vad_regions, refp, di, derr)) {
+            std::fprintf(stderr, "[srt] wrote debug report: %s\n", dbg_path.c_str());
+            logging::logf("INFO", "wrote debug report to %s", dbg_path.c_str());
+        } else {
+            std::fprintf(stderr, "warning: debug report failed (%s)\n", derr.c_str());
+        }
+    }
     return 0;
 }

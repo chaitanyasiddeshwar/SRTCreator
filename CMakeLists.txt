@@ -55,6 +55,7 @@ add_library(srtcore STATIC
   src/models.cpp
   src/log.cpp
   src/separate.cpp
+  src/debug.cpp
 )
 target_include_directories(srtcore PUBLIC
   "${CMAKE_SOURCE_DIR}/src"

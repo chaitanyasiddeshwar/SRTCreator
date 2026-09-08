@@ -6,6 +6,9 @@
 
 namespace transcribe {
 
+// A VAD-detected speech region, in original-timeline seconds.
+struct VadRegion { double t0 = 0.0; double t1 = 0.0; };
+
 struct Options {
     std::string model_path;             // resolved local model file
     std::string language = "auto";      // ISO code or "auto"
@@ -22,6 +25,10 @@ struct Options {
     // Both fire on the worker/whisper thread - marshal to your UI thread.
     std::function<void(const srt::Segment&)> on_segment;
     std::function<void(int)>                 on_progress;
+
+    // Optional debug output: if set, filled with the VAD speech regions whisper
+    // used (original timeline). Null unless --debug.
+    std::vector<VadRegion>* vad_regions = nullptr;
 };
 
 // Transcribe mono 16 kHz float PCM into timestamped segments.

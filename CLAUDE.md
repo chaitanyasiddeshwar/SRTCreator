@@ -198,8 +198,12 @@ Speed / quality:
       --flash-attn        Flash attention (default: ON; --no-flash-attn to off)
       --vad               Silero VAD to skip non-speech (default: ON)
       --threads <N>       CPU threads for pre/post (default: auto)
-      --word-timestamps   Emit word-level timing (tighter sync, slower)
+      --no-word-timestamps Disable DTW word timing (ON by default; snaps each cue
+                          to its actual spoken words for tighter sync, §14)
       --max-line-length   Wrap subtitles to N chars/line (default 42; 0=off)
+      --time-offset <sec> Shift every cue by a constant (+later, -earlier)
+      --dump-audio [path] Write the 16k mono audio whisper hears to a WAV
+                          (debug; auto-on with --isolate-vocals; next to exe)
 
 Model management:
       --models-dir <path> Where models are stored/downloaded
@@ -250,6 +254,7 @@ Runtime requirements for the end user:
 ```
 SRTCreator/
   CLAUDE.md              (this file)
+  ARCHITECTURE.md        end-to-end module + DLL dependency map (CUDA/ONNX/FFmpeg)
   README.md
   CMakeLists.txt         top-level: whisper.cpp (CUDA) + ffmpeg -> srt.exe
   build.bat              MSVC/Ninja/CUDA discovery + cmake wrapper
@@ -332,9 +337,16 @@ SRTCreator/
 Minimal Win32 drag-and-drop front end over the shared `srtcore` library. Drop a
 file -> worker thread runs `audio::decode` + `transcribe::run` + `srt::write`;
 subtitles stream into a read-only EDIT panel with a progress bar. All CLI toggles
-are checkboxes (Translate/VAD/Flash/Word-timestamps/Wrap) plus Model + Language
-dropdowns.
+are checkboxes (Translate/VAD/Flash/Word-timestamps/Wrap, plus Center channel /
+Isolate vocals / **Dump audio**) plus Model + Language + Vocal dropdowns.
 
+- **Dump audio** writes the exact 16 kHz mono track fed to whisper (the isolated
+  vocal stem when isolating, else the plain decoded audio) next to the input as
+  `<stem>.whisper16k.wav` / `<stem>.vocals16k.wav`. Isolating always dumps too. See
+  §14.
+- Checkbox rows are laid out in `layout()` with explicit per-item widths; keep them
+  generous so labels don't truncate under DPI scaling (e.g. "Center channel
+  (dialogue)" needs ~205px).
 - Live updates use `transcribe::Options.on_segment` / `on_progress`, which wrap
   whisper's `new_segment_callback` / `progress_callback`. These fire on the worker
   thread and are marshaled to the UI thread via `PostMessage` (`WM_APP_*`).
@@ -355,10 +367,17 @@ Optional music-removal stage before whisper, to recover dialogue under score.
   with per-model params from UVR's model_data.json + download URLs. Local copies
   live in `%LOCALAPPDATA%\SRTCreator\models`.
 - **Pipeline when enabled:** decode 44.1k stereo -> MDX separate -> vocals ->
-  resample to 16k mono -> whisper. Whisper's VAD is bypassed when isolating
-  (music already gone; its long-segment remapping only hurt).
+  resample to 16k mono -> whisper. **VAD stays ON when isolating** (it runs on the
+  isolated stem). It was once force-disabled here, but that was a bug: without VAD
+  whisper back-dates segment starts across silence gaps (cues appear seconds early)
+  and falls into 30+ minute repetition loops on isolated-stem artifacts. Running
+  Silero VAD on the stem trims leading silence so cue starts track the real onset
+  and the loops disappear. See §14.
 - **Flags/UI:** CLI `--isolate-vocals [--vocal-model <name>]`; GUI checkbox +
-  "Vocal:" dropdown. **Off by default.**
+  "Vocal:" dropdown. **Off by default.** When isolating, the isolated 16 kHz mono
+  vocal stem is auto-dumped as a WAV (CLI: next to the exe via `--dump-audio`
+  logic; GUI: next to the input as `<stem>.vocals16k.wav`) so the separation
+  result is always auditable - see §14.
 - **Deps:** `third_party/onnxruntime` (DirectML build, provided locally,
   git-ignored) + `third_party/pocketfft_hdronly.h`. `NOMINMAX` before `windows.h`
   (else `max` macro breaks pocketfft/std).
@@ -368,13 +387,72 @@ Optional music-removal stage before whisper, to recover dialogue under score.
 > isolation was near-perfect on the narration-heavy opening (~90%) but on the
 > full action film scored ~63% recall with more hallucination (residual score in
 > loud scenes) and ~7 min runtime. So VAD remains the default; isolation is an
-> opt-in that helps dialogue-over-music but is not yet a universal win. Possible
-> improvements: verify the MDX STFT/iSTFT against UVR bit-for-bit, try the
-> instrumental model (vocals = mix - inst), or add an energy/Silero VAD on the
-> isolated stem to drop instrumental gaps before whisper.
+> opt-in that helps dialogue-over-music but is not yet a universal win. Two
+> mitigations since: the windowed dedup in §13 collapses residual repeated lines,
+> and **Silero VAD now runs on the isolated stem** (§12/§14) - this was the biggest
+> fix, killing the multi-minute repetition loops and the early cue timing that the
+> old "disable VAD when isolating" behavior caused. Possible further improvements:
+> verify the MDX STFT/iSTFT against UVR bit-for-bit, or try the instrumental model
+> (vocals = mix - inst).
 
 ## 13. srt::write
 
-Wraps text (default 42 chars/line, balanced) and **collapses consecutive
-duplicate cues** - important because whisper loops the same line over ambiguous
+Wraps text (default 42 chars/line, balanced) and **de-duplicates hallucinated
+cues** - important because whisper loops the same line over ambiguous/scored
 audio (seen ~1200x on one film); dropping repeats keeps the SRT clean.
+
+Dedup is **windowed and normalized**, not just consecutive-exact: each cue's text
+is normalized (lowercased, punctuation stripped, whitespace collapsed) and dropped
+if it matches any of the last `kDedupWindow` (6) emitted cues. This catches
+back-to-back repeats *and* alternating loops (A B A B) and lightly re-punctuated
+restatements, which the old exact-consecutive check missed. The window is small so
+genuinely repeated short dialogue survives.
+
+## 14. Timing & audio debugging
+
+Whisper's **segment-level timestamps are not frame-accurate**. Measured against
+Tron.Ares's official embedded English subtitle (extract with `ffmpeg -i in.mkv
+-map 0:s:m:language:eng -c:s srt ref.srt`):
+
+- **VAD path (default):** our cues *lag* the reference by a fairly constant
+  ~0.35-0.48 s across the opening. VAD's `speech_pad_ms`/segment remapping plus
+  whisper's coarse boundaries account for it. Very short/quiet cues (e.g. the
+  opening "The Grid.") can also be dropped by VAD.
+- **Vocal-isolation path:** VAD now runs on the isolated stem too (§12). When it
+  was disabled, whisper timed the whole stream with no silence trimming, so cue
+  starts *led* the audio badly after any gap (e.g. a cue whose speech began at
+  24:17 was stamped 24:06) and whisper looped a single line for 30+ minutes,
+  losing the rest of the film. Confirmed fix: with VAD on the stem the same cue
+  stamps 24:16.8 and the full film transcribes.
+
+`--time-offset <sec>` (post-shift applied in `main.cpp` before `srt::write`,
+clamped at 0) is the lever for a constant residual lead/lag. `--dump-audio [path]`
+writes the exact 16 kHz mono buffer fed to whisper (the isolated vocal stem when
+isolating) as a 16-bit WAV via `audio::write_wav`, next to the exe by default;
+auto-on when isolating so the separation result is always auditable.
+
+### DTW word timing (ON by default)
+
+The real sync fix is **per-token DTW timing**, now applied in `transcribe.cpp`:
+when `word_timestamps` is on we replace each segment's t0/t1 with the first/last
+real (non-special) token's DTW time, which locates words acoustically instead of
+using whisper's back-dated segment boundary. This is `word_ts = true` by default
+(CLI `--no-word-timestamps` to disable; GUI checkbox pre-checked); cost is ~5%.
+
+> **Critical gotcha:** use `whisper_full_get_token_t0/t1(ctx, i, j)`, **not**
+> `whisper_full_get_token_data(ctx, i, j).t0`. With VAD on, whisper remaps *segment*
+> times to the original timeline but the raw token_data times stay in the
+> VAD-*compressed* timeline; only the `..._get_token_t0/t1` accessors run them
+> through `whisper_map_token_time_segment_aware`. Using the raw ones shifts every
+> cue (a 24:17 cue came out at 14:31 - the compressed-time equivalent). These
+> remapping token accessors are a local addition to vendored whisper.cpp (see
+> `src/whisper.cpp` ~L8188/L8218) and are declared in `include/whisper.h`.
+
+Measured effect: on Transformers.One this tightened ~260/693 cues, e.g. a cue
+back-dated to 02:13 snapped to its real 02:22 onset. **Remaining limit:** vocal
+isolation can leave *loud* speech-like residual in dialogue gaps (measured -29 dB
+mean / -5 dB peak, equal to real speech). VAD keeps it, and DTW also latches onto
+it, so the pathological 24:17 case still lands ~24:12 (5 s early) and varies
+run-to-run with CUDA non-determinism. That is an isolation-quality ceiling, not a
+timing-code bug; plain (non-isolation) transcription is unaffected. Further gains
+would need cleaner separation or a forced-alignment pass.

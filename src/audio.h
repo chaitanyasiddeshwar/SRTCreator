@@ -29,4 +29,10 @@ bool decode(const std::string& path, const DecodeOptions& opts,
 bool resample_to_mono(const std::vector<float>& in, int in_rate, int in_channels,
                       int out_rate, std::vector<float>& out, std::string& err);
 
+// Write interleaved float PCM to a 16-bit PCM WAV file (for debugging: the audio
+// whisper actually hears, e.g. an isolated vocal stem). Returns false/err on I/O
+// failure. Samples are clamped to [-1, 1].
+bool write_wav(const std::string& path, const std::vector<float>& pcm,
+               int sample_rate, int channels, std::string& err);
+
 } // namespace audio

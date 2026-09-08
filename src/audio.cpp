@@ -2,6 +2,9 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -234,6 +237,46 @@ bool resample_to_mono(const std::vector<float>& in, int in_rate, int in_channels
     av_channel_layout_uninit(&in_ch);
     av_channel_layout_uninit(&out_ch);
     if (!ok || out.empty()) { err = "resample produced no output"; return false; }
+    return true;
+}
+
+bool write_wav(const std::string& path, const std::vector<float>& pcm,
+               int sample_rate, int channels, std::string& err) {
+    if (channels < 1) channels = 1;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { err = "could not open wav for writing: " + path; return false; }
+
+    const uint32_t n_samples   = (uint32_t)pcm.size();          // total interleaved samples
+    const uint16_t bits        = 16;
+    const uint16_t block_align = (uint16_t)(channels * bits / 8);
+    const uint32_t byte_rate   = (uint32_t)sample_rate * block_align;
+    const uint32_t data_bytes  = n_samples * (bits / 8);
+    const uint32_t riff_bytes  = 36 + data_bytes;
+
+    auto w32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto w16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+
+    std::fwrite("RIFF", 1, 4, f); w32(riff_bytes); std::fwrite("WAVE", 1, 4, f);
+    std::fwrite("fmt ", 1, 4, f); w32(16); w16(1 /*PCM*/); w16((uint16_t)channels);
+    w32((uint32_t)sample_rate); w32(byte_rate); w16(block_align); w16(bits);
+    std::fwrite("data", 1, 4, f); w32(data_bytes);
+
+    // Convert float [-1,1] -> int16, in modest blocks to bound memory.
+    std::vector<int16_t> buf;
+    const size_t BLOCK = 1u << 16;
+    buf.reserve(std::min<size_t>(BLOCK, pcm.size()));
+    for (size_t i = 0; i < pcm.size(); ) {
+        buf.clear();
+        size_t end = std::min(i + BLOCK, pcm.size());
+        for (; i < end; ++i) {
+            float s = pcm[i];
+            if (s >  1.0f) s =  1.0f;
+            if (s < -1.0f) s = -1.0f;
+            buf.push_back((int16_t)std::lround(s * 32767.0f));
+        }
+        std::fwrite(buf.data(), sizeof(int16_t), buf.size(), f);
+    }
+    std::fclose(f);
     return true;
 }
 

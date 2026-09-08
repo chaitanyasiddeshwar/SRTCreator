@@ -22,6 +22,7 @@
 #include "models.h"
 #include "separate.h"
 #include "log.h"
+#include "debug.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
@@ -37,14 +38,14 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define WM_APP_DONE     (WM_APP + 5) // lParam = wchar_t* ; wParam = success
 
 enum {
-    ID_TRANSLATE = 1001, ID_VAD, ID_FLASH, ID_WORDTS, ID_WRAP, ID_CENTER, ID_ISOLATE,
+    ID_TRANSLATE = 1001, ID_VAD, ID_FLASH, ID_WORDTS, ID_WRAP, ID_CENTER, ID_ISOLATE, ID_DUMP, ID_DEBUG,
     ID_MODEL, ID_LANG, ID_VMODEL, ID_EDIT, ID_PROGRESS, ID_STATUS,
     ID_INPUT, ID_INPUT_BROWSE, ID_OUTPUT, ID_OUTPUT_BROWSE, ID_START
 };
 
 static HWND g_status;
 static HWND g_input_lbl, g_input, g_input_browse, g_output_lbl, g_output, g_output_browse;
-static HWND g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center, g_isolate;
+static HWND g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center, g_isolate, g_dump, g_debug;
 static HWND g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel, g_start;
 static HWND g_edit, g_progress;
 static std::atomic<bool> g_running{false};
@@ -94,7 +95,7 @@ struct Job {
     HWND hwnd;
     std::wstring input, output;
     std::string model, language, vocal_model;
-    bool translate, vad, flash, word_ts, center, isolate;
+    bool translate, vad, flash, word_ts, center, isolate, dump_audio, debug;
     int max_line_length;
 };
 
@@ -120,7 +121,10 @@ static void do_job(Job job) {
     }
 
     std::string vad_path;
-    bool vad = job.vad && !job.isolate; // isolation removes music; VAD not needed
+    // VAD stays on even when isolating: on the isolated stem it trims leading
+    // silence (so cue starts track the real onset) and prevents whisper's
+    // repetition loops. See main.cpp / CLAUDE.md §14.
+    bool vad = job.vad;
     if (vad) {
         post_str(hwnd, WM_APP_STATUS, 0, L"Preparing VAD model…");
         if (!models::ensure_vad(models_dir, true, vad_path, err, dl)) {
@@ -175,6 +179,24 @@ static void do_job(Job job) {
     }
     logging::logf("INFO", "audio ready %.1f min", pcm.size() / 16000.0 / 60.0);
 
+    // Dump the exact 16 kHz mono track fed to whisper (the isolated vocal stem
+    // when isolating, otherwise the plain decoded audio), next to the input - ONLY
+    // when the Dump audio box is checked. We never need this file internally, so
+    // isolating alone must not leave one behind.
+    if (job.dump_audio) {
+        std::string dump = input;
+        size_t dot = dump.find_last_of('.');
+        dump = (dot == std::string::npos ? dump : dump.substr(0, dot))
+             + (job.isolate ? ".vocals16k.wav" : ".whisper16k.wav");
+        std::string werr;
+        if (audio::write_wav(dump, pcm, 16000, 1, werr)) {
+            logging::logf("INFO", "dumped whisper input audio to %s", dump.c_str());
+            post_str(hwnd, WM_APP_SEGMENT, 0, L"[debug] wrote audio: " + to_wide(dump) + L"\r\n");
+        } else {
+            logging::error("audio dump failed: " + werr);
+        }
+    }
+
     PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0);
     post_str(hwnd, WM_APP_STATUS, 0, L"Transcribing…");
     logging::info("transcribing");
@@ -187,8 +209,15 @@ static void do_job(Job job) {
     t.vad             = vad;
     t.vad_model_path  = vad_path;
     t.word_timestamps = job.word_ts;
+    std::vector<transcribe::VadRegion> vad_regions;
+    if (job.debug) t.vad_regions = &vad_regions;
     t.on_progress = [hwnd](int pct) { PostMessageW(hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0); };
-    t.on_segment  = [hwnd](const srt::Segment& s) {
+    // Dedup the live transcript the same way the SRT writer does, so the scrolling
+    // panel doesn't fill with whisper's repeated hallucination lines. The callback
+    // fires synchronously on this worker thread, so a stack-local Deduper is safe.
+    srt::Deduper live_dedup;
+    t.on_segment  = [hwnd, &live_dedup](const srt::Segment& s) {
+        if (live_dedup.is_duplicate(s.text)) return;
         std::wstring line = L"[" + to_wide(srt::format_timestamp(s.t0)).substr(0, 8) + L"]  "
                           + to_wide(s.text) + L"\r\n";
         post_str(hwnd, WM_APP_SEGMENT, 0, line);
@@ -204,6 +233,20 @@ static void do_job(Job job) {
     if (srt::write(segments, to_utf8(out), job.max_line_length, err)) {
         PostMessageW(hwnd, WM_APP_PROGRESS, 100, 0);
         logging::info("wrote " + to_utf8(out));
+        // Timing diagnostics next to the SRT (same folder as the output).
+        if (job.debug) {
+            debugreport::Info di;
+            di.model = job.model; di.isolate = job.isolate; di.center = job.center;
+            di.vad = vad; di.word_ts = job.word_ts;
+            std::string dbg = to_utf8(out) + ".debug.txt";
+            std::string derr;
+            if (debugreport::write(dbg, pcm, segments, vad_regions, nullptr, di, derr)) {
+                logging::info("wrote debug report " + dbg);
+                post_str(hwnd, WM_APP_SEGMENT, 0, L"[debug] wrote report: " + to_wide(dbg) + L"\r\n");
+            } else {
+                logging::error("debug report failed: " + derr);
+            }
+        }
         post_str(hwnd, WM_APP_DONE, 1, L"Saved: " + out);
         return;
     }
@@ -261,6 +304,8 @@ static void start_job(HWND hwnd) {
     job.word_ts   = checked(g_wordts);
     job.center    = checked(g_center);
     job.isolate   = checked(g_isolate);
+    job.dump_audio = checked(g_dump);
+    job.debug     = checked(g_debug);
     job.max_line_length = checked(g_wrap) ? 42 : 0;
     set_busy(true);
     std::thread(run_job, job).detach();
@@ -306,16 +351,17 @@ static void layout(HWND hwnd) {
     MoveWindow(g_output, m + lw, y, W - 2 * m - lw - bw - 6, 24, TRUE);
     MoveWindow(g_output_browse, W - m - bw, y, bw, 24, TRUE); y += 32;
 
-    // Checkbox row 1: transcription options.
+    // Checkbox row 1: transcription options. Widths include the checkbox glyph +
+    // padding, sized generously so labels never truncate under DPI scaling.
     int x = m;
     struct { HWND h; int w; } r1[] = {
-        {g_translate, 160}, {g_vad, 62}, {g_flash, 135}, {g_wordts, 150}, {g_wrap, 130}
+        {g_translate, 175}, {g_vad, 60}, {g_flash, 145}, {g_wordts, 160}, {g_wrap, 145}
     };
-    for (auto& c : r1) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 10; }
+    for (auto& c : r1) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 12; }
     y += 28;
     // Checkbox row 2: dialogue-audio options.
     x = m;
-    struct { HWND h; int w; } r2[] = { {g_center, 180}, {g_isolate, 230} };
+    struct { HWND h; int w; } r2[] = { {g_center, 200}, {g_isolate, 228}, {g_dump, 150}, {g_debug, 120} };
     for (auto& c : r2) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 10; }
     y += 32;
 
@@ -362,10 +408,13 @@ static void create_controls(HWND hwnd) {
     g_wrap      = mk(hwnd, L"BUTTON", L"Wrap lines (42)",     BS_AUTOCHECKBOX, ID_WRAP);
     g_center    = mk(hwnd, L"BUTTON", L"Center channel (dialogue)", BS_AUTOCHECKBOX, ID_CENTER);
     g_isolate   = mk(hwnd, L"BUTTON", L"Isolate vocals (remove music)", BS_AUTOCHECKBOX, ID_ISOLATE);
+    g_dump      = mk(hwnd, L"BUTTON", L"Dump audio (debug)", BS_AUTOCHECKBOX, ID_DUMP);
+    g_debug     = mk(hwnd, L"BUTTON", L"Debug report", BS_AUTOCHECKBOX, ID_DEBUG);
     SendMessageW(g_vad,    BM_SETCHECK, BST_CHECKED, 0);
     SendMessageW(g_flash,  BM_SETCHECK, BST_CHECKED, 0);
     SendMessageW(g_wrap,   BM_SETCHECK, BST_CHECKED, 0);
     SendMessageW(g_center, BM_SETCHECK, BST_CHECKED, 0);
+    SendMessageW(g_wordts, BM_SETCHECK, BST_CHECKED, 0); // DTW word timing: tighter cue sync
 
     g_model_lbl = mk(hwnd, L"STATIC", L"Model:", SS_LEFT, 0);
     g_model = mk(hwnd, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_MODEL);
@@ -399,14 +448,14 @@ static void create_controls(HWND hwnd) {
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     for (HWND h : { g_status, g_input_lbl, g_input, g_input_browse, g_output_lbl, g_output,
                     g_output_browse, g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center,
-                    g_isolate, g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel,
+                    g_isolate, g_dump, g_debug, g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel,
                     g_start, g_edit })
         SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
 }
 
 static void set_busy(bool busy) {
     for (HWND h : { g_start, g_input_browse, g_output_browse, g_input, g_output,
-                    g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center, g_isolate,
+                    g_translate, g_vad, g_flash, g_wordts, g_wrap, g_center, g_isolate, g_dump, g_debug,
                     g_model, g_lang, g_vmodel })
         EnableWindow(h, !busy);
 }

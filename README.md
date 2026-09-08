@@ -14,6 +14,9 @@ srt "D:\Movies\Some.Movie.mkv"
 On an RTX 3080 Ti it transcribes roughly **70× faster than real time**
 (a 2-hour movie in ~1.5 minutes) with the default model.
 
+> Curious how it fits together — the CUDA/whisper, ONNX/DirectML, and FFmpeg
+> stacks and every runtime DLL? See [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ---
 
 ## Features
@@ -26,6 +29,11 @@ On an RTX 3080 Ti it transcribes roughly **70× faster than real time**
   (`--translate`).
 - **Voice Activity Detection (VAD)** to skip music/silence (on by default).
 - **Readable line wrapping** (Netflix-style 42 chars/line by default).
+- **Hallucination de-duplication** — whisper tends to loop the same line over
+  music/ambiguous audio; repeated cues (even alternating or lightly re-punctuated)
+  are collapsed automatically.
+- **Debug aids** — dump the exact audio whisper hears (`--dump-audio`) and nudge
+  subtitle sync (`--time-offset`).
 - **Self-contained** — models download automatically on first use.
 
 ---
@@ -55,8 +63,12 @@ transcribes, shows the subtitles live in a panel with a progress bar, and saves
 
 - Checkboxes: **Translate → English**, **VAD**, **Flash attention**,
   **Word timestamps**, **Wrap lines (42)**, **Center channel (dialogue)**,
-  **Isolate vocals (remove music)**
+  **Isolate vocals (remove music)**, **Dump audio (debug)**
 - Dropdowns: **Model**, **Language**, and **Vocal** (separation model)
+
+> **Dump audio (debug)** saves the exact 16 kHz mono track whisper transcribes
+> next to the input (`<name>.whisper16k.wav`, or `<name>.vocals16k.wav` when
+> isolating vocals) so you can hear precisely what the model heard.
 
 > **Vocal isolation** (optional) removes music/effects before transcribing, which
 > helps dialogue buried under a score. It's GPU-accelerated but adds a few minutes
@@ -89,7 +101,9 @@ srt <input> [options]
 | `--isolate-vocals` | off | Remove music/effects with a separation model (MDX-Net, GPU) before transcribing. Helps dialogue over score; slower (~minutes) and off by default. |
 | `--vocal-model <name>` | Kim_Vocal_2 | Separation model: `Kim_Vocal_2`, `UVR-MDX-NET-Inst_HQ_3`, `UVR_MDXNET_KARA_2`. |
 | `--no-flash-attn` | flash on | Disable flash attention (rarely needed). |
-| `--word-timestamps` | off | Compute word-level timestamps (tighter sync, slightly slower). |
+| `--no-word-timestamps` | word-ts on | Disable DTW word-level timing. It's **on by default**: each cue is snapped to the actual spoken words (via whisper's DTW), which fixes cues that would otherwise appear early. Costs ~5%. |
+| `--time-offset <sec>` | `0` | Shift every cue by a constant (`+` later, `-` earlier). Use to fix a consistent sync lead/lag (see [Debugging sync](#debugging-sync--audio)). |
+| `--dump-audio [path]` | off | Write the exact 16 kHz mono audio whisper hears to a WAV (the isolated vocal stem with `--isolate-vocals`). Auto-on when isolating. Lands next to `srt.exe` if no path is given. |
 | `--threads <n>` | auto | CPU worker threads for pre/post-processing. |
 | `--models-dir <path>` | `%LOCALAPPDATA%\SRTCreator\models` | Where models are stored/downloaded. |
 | `--download <name>` | — | Download a model and exit (e.g. `srt --download large-v3`). |
@@ -122,7 +136,36 @@ srt movie.mkv --audio-stream 2
 
 :: Pre-download a model
 srt --download large-v3-turbo-q8_0
+
+:: Nudge subtitles 0.4s later if they appear early
+srt movie.mkv --time-offset 0.4
+
+:: Isolate vocals and keep the isolated audio to inspect what whisper heard
+srt movie.mkv --isolate-vocals --dump-audio
 ```
+
+### Debugging sync & audio
+
+Two flags help when subtitles feel out of sync or the transcription looks wrong:
+
+- **`--dump-audio [path]`** writes the precise 16 kHz mono audio that whisper
+  transcribes to a `.wav` (next to `srt.exe` by default). This is exactly what the
+  model "hears" — with `--isolate-vocals` it's the isolated vocal stem, so you can
+  listen and judge whether separation actually cleaned up the dialogue. It's
+  turned on automatically whenever `--isolate-vocals` is used.
+- **`--time-offset <sec>`** shifts every cue by a fixed amount. Whisper's
+  timestamps aren't perfectly frame-accurate; if you see a consistent lead/lag,
+  correct it here (e.g. `--time-offset -0.3` to move cues earlier). To measure it,
+  compare against a known-good reference track — extract a film's embedded English
+  subtitles with `ffmpeg -i movie.mkv -map 0:s:m:language:eng -c:s srt ref.srt` and
+  diff the timings.
+
+Sync accuracy comes mainly from two things, both on by default: **VAD** (trims
+non-speech so cue starts track the real onset) and **DTW word timing** (snaps each
+cue to its actual first/last word). A residual case remains: **vocal isolation**
+can leave loud non-speech artifacts in gaps that both VAD and DTW mistake for
+speech, so a cue there may still start early. That's an isolation-quality limit,
+not a timing bug — plain (non-isolation) transcription is unaffected.
 
 ### Models
 
