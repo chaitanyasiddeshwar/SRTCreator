@@ -47,6 +47,15 @@ if not exist "%~dp0third_party\ffmpeg\include" (
     exit /b 1
 )
 
+rem --- Apply whisper.cpp patches if needed ---
+if exist "%~dp0patches\whisper.patch" (
+    git -C "%~dp0third_party\whisper.cpp" apply --check "%~dp0patches\whisper.patch" >nul 2>&1
+    if not errorlevel 1 (
+        echo [build] Applying patches\whisper.patch to third_party\whisper.cpp...
+        git -C "%~dp0third_party\whisper.cpp" apply "%~dp0patches\whisper.patch"
+    )
+)
+
 rem --- clean ---
 if /i "%~1"=="clean" (
     echo [build] clean: removing build\
@@ -59,7 +68,7 @@ if errorlevel 1 (
     echo [build] cmake configure FAILED
     exit /b 1
 )
-cmake --build build
+cmake --build build %*
 if errorlevel 1 (
     echo [build] build FAILED
     exit /b 1

@@ -34,13 +34,37 @@ double db_at(const std::vector<double>& db, double t) {
     return db[b];
 }
 
-// First time in [from, to] whose bin is >= threshold; -1 if none voiced.
-double voiced_onset(const std::vector<double>& db, double from, double to) {
-    if (from < 0) from = 0;
-    int b0 = (int)(from / kBinSec), b1 = (int)(to / kBinSec);
-    for (int b = b0; b <= b1 && b < (int)db.size(); ++b)
-        if (b >= 0 && db[b] >= kThrDb) return b * kBinSec;
-    return -1.0;
+// Compute how early (+) or late (-) cue start c.t0 is relative to voiced energy.
+// If audio at c.t0 is quiet (< kThrDb): speech hasn't started yet.
+// Scan forward in [c.t0, min(c.t1, c.t0 + 3.0)] for the first voiced frame (>= kThrDb).
+// If found at t_onset >= c.t0, early_by = +(t_onset - c.t0).
+// If audio at c.t0 is voiced (>= kThrDb): speech was already active.
+// Scan backward in [max(0, c.t0 - 2.0), c.t0] for the start of this voiced burst.
+// If found at t_onset <= c.t0, early_by = -(c.t0 - t_onset) (i.e. late by that amount).
+double compute_early_by(const std::vector<double>& db, double t0, double t1) {
+    double e = db_at(db, t0);
+    if (e < kThrDb) {
+        int b0 = (int)(t0 / kBinSec);
+        int b_end = std::min((int)db.size(), (int)(std::min(t1, t0 + 3.0) / kBinSec));
+        for (int b = b0; b < b_end; ++b) {
+            if (b >= 0 && db[b] >= kThrDb) {
+                return (b * kBinSec) - t0;
+            }
+        }
+        return 0.0;
+    } else {
+        int b0 = (int)(t0 / kBinSec);
+        int b_min = std::max(0, (int)((t0 - 2.0) / kBinSec));
+        int b_start = b0;
+        for (int b = b0; b >= b_min; --b) {
+            if (db[b] < kThrDb) {
+                b_start = b + 1;
+                break;
+            }
+            b_start = b;
+        }
+        return (b_start * kBinSec) - t0;
+    }
 }
 
 // Index of the VAD region covering t, or -1.
@@ -52,12 +76,13 @@ int vad_index(const std::vector<transcribe::VadRegion>& v, double t) {
 
 // Nearest reference cue by start time; returns index or -1. Prefers overlap.
 int nearest_ref(const std::vector<srt::Segment>& ref, const srt::Segment& c) {
-    int best = -1; double bestd = 1e18;
+    int best = -1; double best_score = 1e18;
     for (int i = 0; i < (int)ref.size(); ++i) {
         double ov = std::min(c.t1, ref[i].t1) - std::max(c.t0, ref[i].t0);
-        double d  = ov > 0 ? 0.0 : std::abs(ref[i].t0 - c.t0); // overlap wins
-        double key = d + (ov > 0 ? 0.0 : 0.0) + std::abs(ref[i].t0 - c.t0) * 1e-6;
-        if (key < bestd) { bestd = key; best = i; }
+        double d  = std::abs(ref[i].t0 - c.t0);
+        if (ov <= 0.0 && d > 5.0) continue;
+        double score = (ov > 0.0) ? (d - 100.0 * ov) : d;
+        if (score < best_score) { best_score = score; best = i; }
     }
     return best;
 }
@@ -140,8 +165,7 @@ bool write(const std::string& path,
 
     for (int i = 0; i < (int)cues.size(); ++i) {
         const auto& c = cues[i];
-        double onset = voiced_onset(db, c.t0 - 2.0, c.t1);
-        double early = (onset >= 0) ? onset - c.t0 : 0.0; // + => voice starts after cue (early)
+        double early = compute_early_by(db, c.t0, c.t1);
         int vr = vad_index(vad, c.t0);
         early_all.push_back(early);
 

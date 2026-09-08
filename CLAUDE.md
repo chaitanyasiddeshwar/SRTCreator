@@ -22,7 +22,7 @@ it.
 - **Minimal external process dependencies at runtime.** FFmpeg is *statically
   linked in* (audio path only) rather than shelled out to.
 
-Non-goals (for now): GUI, real-time/live captioning, speaker diarization,
+Non-goals: real-time/live captioning, speaker diarization,
 translation UI polish (basic translate-to-English is supported by the engine and
 exposed as a flag). Burn-in / hardsub is out of scope — we emit `.srt` only.
 
@@ -30,24 +30,29 @@ exposed as a flag). Burn-in / hardsub is out of scope — we emit `.srt` only.
 
 ## 2. Architecture (decided)
 
-Three vendored components compiled into **one** executable:
+Four core components compiled into **one** static library (`srtcore`) linked by CLI (`srt.exe`) and Win32 GUI (`srtgui.exe`):
 
 | Component | Role | Integration |
 |---|---|---|
 | **whisper.cpp** (+ ggml) | ASR: audio -> timestamped text | Vendored source, static link, **CUDA** backend |
-| **FFmpeg** (minimized) | Decode any container/codec -> 16 kHz mono f32 PCM | Minimized **static** build, audio path only |
-| **App core** (`main.cpp` + glue) | CLI, pipeline, SRT writer, model mgmt | Our code |
+| **ONNX Runtime + DirectML** | MDX-Net vocal isolation (Kim_Vocal_2) | Shipped dynamic DLLs, DirectML GPU execution |
+| **FFmpeg** (minimized) | Decode any container/codec -> 16/44.1 kHz PCM | Shared/static build, audio path only |
+| **App core** (`srtcore`) | CLI/GUI, pipeline, timeline analysis, infill, SRT writer | Our code (`main.cpp`, `gui/main_gui.cpp`, `timeline.cpp`, etc.) |
 
-Runtime pipeline:
+Runtime pipeline (5 sequential phases, 3 timing passes):
 
 ```
 input file
   -> libavformat  demux, pick best audio stream
-  -> libavcodec   decode audio packets
-  -> libswresample resample -> 16 kHz, mono, float32
-  -> (optional) Silero VAD: drop non-speech regions
-  -> whisper.cpp (CUDA, flash-attn) -> segments with timestamps
-  -> SRT writer -> <input>.srt
+  -> libavcodec   decode audio packets -> multichannel/stereo
+  -> [Phase 2]    MDX-Net vocal isolation via DirectML (Kim_Vocal_2) -> free mix buffer
+  -> libswresample resample -> 16 kHz mono f32 PCM -> free 44.1k vocals buffer
+  -> [Phase 3 / Pass 1] whisper.cpp (CUDA Session, Silero VAD, flash-attn, DTW word timing) -> raw cues + timeline
+  -> [Phase 4 / Pass 2] silence sanitization: trailing silence clamp, leading snap, pause split (>= 1.5s), hallucination prune -> export <input>.timeline.json
+  -> [Pass 2.5]   detect missing vocal regions (duration >= 0.8s, coverage < 20%)
+  -> [Phase 5 / Pass 3] targeted audio infill using active CUDA Session -> chronologically splice dialogue
+  -> Resource cleanup: free PCM buffer, close Session, cudaDeviceReset(), compact working set
+  -> SRT writer   wrap (42 cols) + windowed de-dup -> <input>.srt
 ```
 
 ### Why this stack
@@ -196,14 +201,20 @@ Common options:
 
 Speed / quality:
       --flash-attn        Flash attention (default: ON; --no-flash-attn to off)
-      --vad               Silero VAD to skip non-speech (default: ON)
+      --vad               Silero VAD to skip non-speech (always ON)
       --threads <N>       CPU threads for pre/post (default: auto)
       --no-word-timestamps Disable DTW word timing (ON by default; snaps each cue
                           to its actual spoken words for tighter sync, §14)
       --max-line-length   Wrap subtitles to N chars/line (default 42; 0=off)
       --time-offset <sec> Shift every cue by a constant (+later, -earlier)
+      --no-center         Don't isolate the front-center channel on 5.1/7.1 audio
+      --vocal-model <name> Separation model: Kim_Vocal_2 (default), Inst_HQ_3, KARA_2
+      --no-infill         Disable Pass 3 targeted audio infill for missed vocal regions
+      --pause-split <sec> Silence duration threshold to split mid-sentence cue (default: 1.5)
+      --timeline-json <path> Explicit path for timeline intervals JSON export
       --dump-audio [path] Write the 16k mono audio whisper hears to a WAV
-                          (debug; auto-on with --isolate-vocals; next to exe)
+                          (debug; auto-on with vocal isolation; next to exe)
+      --debug             Write detailed timing diagnostics report (<output>.debug.txt)
 
 Model management:
       --models-dir <path> Where models are stored/downloaded
@@ -259,12 +270,16 @@ SRTCreator/
   CMakeLists.txt         top-level: whisper.cpp (CUDA) + ffmpeg -> srt.exe
   build.bat              MSVC/Ninja/CUDA discovery + cmake wrapper
   .gitignore
-  src/                   (audio+transcribe+srt+models compile into the srtcore lib)
+  src/                   (audio+transcribe+separate+timeline+srt+models compile into srtcore)
     main.cpp             CLI + orchestration (-> srt.exe)
     audio.{h,cpp}        FFmpeg demux/decode/resample -> f32 16k mono
-    transcribe.{h,cpp}   whisper.cpp wrapper, VAD, options, live callbacks
+    separate.{h,cpp}     MDX-Net ONNX vocal isolation (DirectML)
+    transcribe.{h,cpp}   whisper.cpp wrapper, Session, VAD, options, live callbacks
+    timeline.{h,cpp}     Silence/vocal timeline analysis, sanitization, infill orchestration
     srt.{h,cpp}          SRT formatting / writing + line wrapping
     models.{h,cpp}       model resolution + download
+    debug.{h,cpp}        timing and acoustic diagnostics
+    log.{h,cpp}          thread-safe logger + crash backtrace
     gui/main_gui.cpp     Win32 drag-and-drop GUI (-> srtgui.exe)
   third_party/
     whisper.cpp/         vendored submodule (committed)
@@ -356,9 +371,9 @@ Isolate vocals / **Dump audio**) plus Model + Language + Vocal dropdowns.
   manifestdependency; `SetProcessDPIAware()` at startup.
 - Model downloads are in-process (`URLDownloadToFile`, no console) with progress.
 
-## 12. Vocal isolation (`separate.{h,cpp}`, optional)
+## 12. Vocal isolation (`separate.{h,cpp}`, always-on)
 
-Optional music-removal stage before whisper, to recover dialogue under score.
+Music-removal stage before whisper, to isolate dialogue and strip musical score and sound effects. Enabled by default across the pipeline.
 
 - **Engine:** MDX-Net ONNX models (UVR), run on the GPU via **ONNX Runtime
   DirectML** (chosen over the CUDA EP to avoid CUDA/cuDNN version coupling with
@@ -366,18 +381,17 @@ Optional music-removal stage before whisper, to recover dialogue under score.
 - **Models:** registry in `separate.cpp` (Kim_Vocal_2 default, Inst_HQ_3, KARA_2)
   with per-model params from UVR's model_data.json + download URLs. Local copies
   live in `%LOCALAPPDATA%\SRTCreator\models`.
-- **Pipeline when enabled:** decode 44.1k stereo -> MDX separate -> vocals ->
+- **Pipeline:** decode 44.1k stereo/multichannel -> MDX separate -> vocals ->
   resample to 16k mono -> whisper. **VAD stays ON when isolating** (it runs on the
   isolated stem). It was once force-disabled here, but that was a bug: without VAD
   whisper back-dates segment starts across silence gaps (cues appear seconds early)
   and falls into 30+ minute repetition loops on isolated-stem artifacts. Running
   Silero VAD on the stem trims leading silence so cue starts track the real onset
   and the loops disappear. See §14.
-- **Flags/UI:** CLI `--isolate-vocals [--vocal-model <name>]`; GUI checkbox +
-  "Vocal:" dropdown. **Off by default.** When isolating, the isolated 16 kHz mono
-  vocal stem is auto-dumped as a WAV (CLI: next to the exe via `--dump-audio`
-  logic; GUI: next to the input as `<stem>.vocals16k.wav`) so the separation
-  result is always auditable - see §14.
+- **Flags/UI:** GUI "Vocal:" dropdown (Kim_Vocal_2 default); CLI `--vocal-model <name>`.
+  The isolated 16 kHz mono vocal stem can be dumped as a WAV via `--dump-audio`
+  (CLI: next to the exe; GUI: `<stem>.vocals16k.wav`) so the separation result is
+  always auditable - see §14.
 - **Deps:** `third_party/onnxruntime` (DirectML build, provided locally,
   git-ignored) + `third_party/pocketfft_hdronly.h`. `NOMINMAX` before `windows.h`
   (else `max` macro breaks pocketfft/std).
@@ -456,3 +470,90 @@ it, so the pathological 24:17 case still lands ~24:12 (5 s early) and varies
 run-to-run with CUDA non-determinism. That is an isolation-quality ceiling, not a
 timing-code bug; plain (non-isolation) transcription is unaffected. Further gains
 would need cleaner separation or a forced-alignment pass.
+
+---
+
+## 15. Multi-Pass Silence & Vocal Analysis Architecture (Pass 2 & Pass 3)
+
+To ensure **no subtitles appear during silent (no vocal) areas** and **no subtitles are missing in vocal areas**, the integrated pipeline uses a multi-pass architecture driven by a structured audio timeline.
+
+### 15.1 Unified Timeline File (`<output>.timeline.json`)
+Pass 1 constructs an exact, contiguous partition of the audio timeline into alternating `vocal` and `silence` intervals, derived from Silero VAD speech detection verified with RMS energy:
+
+```json
+{
+  "media": "Transformers.One.2024.mp4",
+  "total_duration": 6245.5,
+  "vocal_coverage_pct": 49.3,
+  "timeline": [
+    { "type": "silence", "start": 0.0, "end": 127.85, "duration": 127.85 },
+    { "type": "vocal",   "start": 127.85, "end": 129.32, "duration": 1.47, "avg_db": -28.4 },
+    { "type": "silence", "start": 129.32, "end": 133.50, "duration": 4.18 },
+    { "type": "vocal",   "start": 133.50, "end": 134.15, "duration": 0.65, "avg_db": -31.5 },
+    { "type": "silence", "start": 134.15, "end": 143.03, "duration": 8.88 }
+  ],
+  "missing_vocal_regions": [
+    { "start": 450.20, "end": 453.80, "duration": 3.60, "avg_db": -24.1 }
+  ]
+}
+```
+
+### 15.2 Pass 2: Silence Analysis & SRT Sanitization
+Pass 2 runs deterministically on the generated subtitle cues against the timeline map:
+
+1. **Trailing Silence Clamping**:
+   - If a cue's end time ($t_1$) extends into a `silence` interval $[s_0, s_1]$, the speech actually finished at or before $s_0$.
+   - The cue end is clamped to:
+     $$t_1 = \min(t_1, s_0 + \text{min\_read\_buffer})$$
+   - $\text{min\_read\_buffer} = \min(1.4, 0.04 \times \text{chars} + 0.4)$, bounded strictly so $t_1 \le s_1 - 0.050\text{s}$.
+   - Result: Subtitles never linger across multi-second silent gaps.
+
+2. **Leading Silence Snapping**:
+   - If a cue starts inside a `silence` interval before an upcoming `vocal` interval $[v_0, v_1]$, $t_0$ snaps forward to $v_0 - 0.050\text{s}$.
+
+3. **In-Sentence Pause Splitting (Option 2)**:
+   - When a single cue spans across a silence interval $\ge 1.5\text{s}$ (default `--pause-split 1.5`):
+     - The cue is split into two separate subtitle events at the silence boundary using punctuation and word boundaries.
+     - Part 1 ends before the silence interval ($s_0 + \text{read\_pad}$).
+     - The screen remains completely blank of subtitles during the silent pause.
+     - Part 2 begins when the actor resumes speaking ($s_1 - 0.050\text{s}$).
+
+4. **Hallucination Pruning**:
+   - Any cue falling 100% inside a `silence` interval (e.g., Whisper hallucinating music lyrics or repetition loops during instrumental sequences) is discarded.
+
+### 15.3 Pass 2.5: Non-Silence Analysis (Vocal Gap Detection)
+Pass 2.5 validates that no vocal dialogue was missed by Whisper:
+- Iterates across all `vocal` intervals in the timeline.
+- Computes subtitle coverage:
+  $$\text{coverage} = \frac{\sum (\text{cue} \cap \text{vocal\_interval})}{\text{vocal\_duration}}$$
+- Any vocal interval with duration $\ge 0.8\text{s}$ and $\text{coverage} < 0.20$ is flagged as an uncaptioned dialogue candidate and added to `missing_vocal_regions`.
+
+### 15.4 Pass 3: Targeted Audio Infill (Recovering Missed Speech)
+Enabled by default (toggleable via GUI `Infill speech (Pass 3)` or CLI `--no-infill`):
+- Operates via `transcribe::Session`: the Whisper model remains loaded in GPU VRAM from Pass 1, executing targeted inference on each slice in ~25 ms with zero disk I/O or CUDA context re-initialization.
+- For all regions collected in `missing_vocal_regions`:
+  1. Slices the audio buffer covering $[v_{\text{start}} - 0.35\text{s}, v_{\text{end}} + 0.35\text{s}]$.
+  2. Executes targeted Whisper decoding on the slice using `Session::run_slice()`.
+  3. Frees the temporary slice buffer immediately.
+  4. Merges recovered subtitle cues chronologically into the final SRT, verifying that no duplicate or overlapping cues are introduced.
+
+### 15.5 Always-On Pipeline Simplifications
+- **Silero VAD is always enabled**: eliminates early-onset back-dating into silence.
+- **Vocal isolation (MDX-Net / Kim_Vocal_2) is always enabled**: strips score and sound effects prior to transcription.
+- **Per-Phase Timing & Summaries**: Formats all phase durations (Audio extraction, Voice isolation, Transcription, Silence sanitization, Infill) and total elapsed time in `hh:mm:ss` across both logs and GUI transcript, concluding with a comprehensive Post-Processing Summary.
+
+---
+
+## 16. Memory Management & Resource Cleanup
+
+To prevent memory leaks, host RAM saturation, and GPU driver lockups on long UHD movies:
+- **Buffer Swapping**: Audio vectors are reclaimed immediately when their stage finishes using vector swapping (`std::vector<float>().swap(...)`):
+  - `mix` (44.1 kHz stereo) is freed immediately after MDX separation.
+  - `vocals` (44.1 kHz mono) is freed immediately after resampling to 16 kHz.
+  - Slices in Pass 3 are scoped and deallocated per chunk.
+  - `pcm` (16 kHz mono) is freed immediately before SRT formatting.
+- **Single-Session GPU Lifecycle**: `transcribe::Session` keeps the Whisper model loaded once across Pass 1 and Pass 3.
+- **CUDA Device Reset**: `Session::close()` calls `whisper_free(ctx)` followed by `cudaDeviceReset()`, ensuring zero stranded VRAM allocations.
+- **Working Set Compaction**: Calls `SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1)` to release trimmed heap pages back to the Windows Memory Manager.
+- **RAII GUI Guard**: In `srtgui.exe`, a `JobCleanup` RAII guard ensures that all buffers, CUDA sessions, and memory trimmings occur even if a job is cancelled or encounters an error.
+

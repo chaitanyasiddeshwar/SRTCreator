@@ -4,10 +4,19 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace transcribe {
 
@@ -55,11 +64,52 @@ void on_progress_cb(whisper_context* /*ctx*/, whisper_state* /*state*/,
     if (o->on_progress) o->on_progress(progress);
 }
 
+static void reset_gpu_memory() {
+#ifdef _WIN32
+    typedef int (*cuda_fn)();
+    const char* dlls[] = { "cudart64_13.dll", "cudart64_12.dll", "cudart64_11.dll", "cudart64_10.dll" };
+    for (const char* dll : dlls) {
+        HMODULE h = GetModuleHandleA(dll);
+        if (!h) h = LoadLibraryA(dll);
+        if (h) {
+            auto pReset = (cuda_fn)GetProcAddress(h, "cudaDeviceReset");
+            if (pReset) {
+                pReset();
+                logging::info("cuda: device reset called successfully");
+            }
+            break;
+        }
+    }
+#endif
+}
+
 } // namespace
 
-bool run(const std::vector<float>& pcm, const Options& opts,
-         std::vector<srt::Segment>& out, std::string& err) {
-    out.clear();
+Session::Session() : ctx_(nullptr) {}
+
+Session::~Session() {
+    close();
+}
+
+Session::Session(Session&& other) noexcept : ctx_(other.ctx_) {
+    other.ctx_ = nullptr;
+}
+
+Session& Session::operator=(Session&& other) noexcept {
+    if (this != &other) {
+        close();
+        ctx_ = other.ctx_;
+        other.ctx_ = nullptr;
+    }
+    return *this;
+}
+
+bool Session::is_valid() const {
+    return ctx_ != nullptr;
+}
+
+bool Session::init(const Options& opts, std::string& err) {
+    close();
     install_whisper_logging();
 
     whisper_context_params cparams = whisper_context_default_params();
@@ -67,9 +117,30 @@ bool run(const std::vector<float>& pcm, const Options& opts,
     cparams.flash_attn = opts.flash_attn;
     cparams.gpu_device = 0;
 
-    whisper_context* ctx =
-        whisper_init_from_file_with_params(opts.model_path.c_str(), cparams);
-    if (!ctx) { err = "failed to load model: " + opts.model_path; return false; }
+    ctx_ = whisper_init_from_file_with_params(opts.model_path.c_str(), cparams);
+    if (!ctx_) {
+        err = "failed to load model: " + opts.model_path;
+        return false;
+    }
+    return true;
+}
+
+void Session::close() {
+    if (ctx_) {
+        whisper_free(ctx_);
+        ctx_ = nullptr;
+        reset_gpu_memory();
+    }
+}
+
+bool Session::transcribe(const std::vector<float>& pcm, const Options& opts,
+                         std::vector<srt::Segment>& out, std::string& err) {
+    out.clear();
+    if (!ctx_) {
+        err = "whisper session not initialized";
+        return false;
+    }
+    if (pcm.empty()) return true;
 
     whisper_full_params wp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wp.print_progress   = opts.verbose;
@@ -84,7 +155,7 @@ bool run(const std::vector<float>& pcm, const Options& opts,
     wp.detect_language  = false;
 
     // English-only (.en) models cannot auto-detect; pin them to English.
-    if (opts.language == "auto" && !whisper_is_multilingual(ctx)) {
+    if (opts.language == "auto" && !whisper_is_multilingual(ctx_)) {
         wp.language = "en";
     }
     wp.token_timestamps = opts.word_timestamps;
@@ -128,20 +199,19 @@ bool run(const std::vector<float>& pcm, const Options& opts,
         wp.progress_callback_user_data = const_cast<Options*>(&opts);
     }
 
-    if (whisper_full(ctx, wp, pcm.data(), (int)pcm.size()) != 0) {
+    if (whisper_full(ctx_, wp, pcm.data(), (int)pcm.size()) != 0) {
         err = "whisper_full failed";
-        whisper_free(ctx);
         return false;
     }
 
-    int n = whisper_full_n_segments(ctx);
+    int n = whisper_full_n_segments(ctx_);
     out.reserve((size_t)n);
-    const whisper_token eot = whisper_token_eot(ctx);
+    const whisper_token eot = whisper_token_eot(ctx_);
     for (int i = 0; i < n; ++i) {
         srt::Segment s;
-        s.t0 = whisper_full_get_segment_t0(ctx, i) * 0.01; // centiseconds -> s
-        s.t1 = whisper_full_get_segment_t1(ctx, i) * 0.01;
-        const char* txt = whisper_full_get_segment_text(ctx, i);
+        s.t0 = whisper_full_get_segment_t0(ctx_, i) * 0.01; // centiseconds -> s
+        s.t1 = whisper_full_get_segment_t1(ctx_, i) * 0.01;
+        const char* txt = whisper_full_get_segment_text(ctx_, i);
         s.text = txt ? txt : "";
 
         // Tighten start/end to the actual spoken words using per-token DTW times.
@@ -155,39 +225,172 @@ bool run(const std::vector<float>& pcm, const Options& opts,
         // to the original one; the raw token_data times stay compressed and would
         // shift every cue. Requires word_timestamps (adds some cost); no-op off.
         if (opts.word_timestamps) {
-            int nt = whisper_full_n_tokens(ctx, i);
+            int nt = whisper_full_n_tokens(ctx_, i);
             double first = -1.0, last = -1.0;
+            double first_t1 = -1.0;
+            int first_len = 0;
+            double last_t0 = -1.0;
+            int last_len = 0;
             for (int j = 0; j < nt; ++j) {
-                whisper_token_data td = whisper_full_get_token_data(ctx, i, j);
+                whisper_token_data td = whisper_full_get_token_data(ctx_, i, j);
                 if (td.id >= eot || td.t0 < 0) continue; // skip specials / no DTW time
-                double tt0 = whisper_full_get_token_t0(ctx, i, j) * 0.01; // VAD-remapped
-                double tt1 = whisper_full_get_token_t1(ctx, i, j) * 0.01;
-                if (first < 0.0) first = tt0;
+                double tt0 = whisper_full_get_token_t0(ctx_, i, j) * 0.01; // VAD-remapped
+                double tt1 = whisper_full_get_token_t1(ctx_, i, j) * 0.01;
+                const char* tstr = whisper_token_to_str(ctx_, td.id);
+                int tlen = 0;
+                if (tstr) {
+                    while (*tstr == ' ' || *tstr == '\t' || *tstr == '\n') ++tstr;
+                    tlen = (int)std::strlen(tstr);
+                }
+                if (first < 0.0) {
+                    first = tt0;
+                    first_t1 = tt1;
+                    first_len = tlen;
+                }
                 last = tt1;
+                last_t0 = tt0;
+                last_len = tlen;
             }
-            if (first >= 0.0) s.t0 = first;
-            if (last  >  s.t0) s.t1 = last;
+            if (first >= 0.0) {
+                // If the first token duration is suspiciously long, Whisper lacked a
+                // timestamp token before it and back-dated token 0 across leading silence.
+                double max_dur = std::max(0.35, 0.06 * first_len + 0.25);
+                if (first_t1 > first && (first_t1 - first) > max_dur) {
+                    first = std::max(first, first_t1 - max_dur);
+                }
+                s.t0 = first;
+            }
+            if (last > s.t0) {
+                // If the last token duration is suspiciously long, Whisper lacked a
+                // trailing timestamp and forward-dated token N across trailing silence.
+                double max_last_dur = std::max(0.40, 0.08 * last_len + 0.35);
+                if (last_t0 >= 0.0 && (last - last_t0) > max_last_dur) {
+                    last = last_t0 + max_last_dur;
+                }
+                s.t1 = last;
+            }
         }
         out.push_back(std::move(s));
     }
 
-    // Expose VAD speech regions (original timeline) for the debug report: they
-    // let us see whether a cue's back-dated start falls inside a region VAD kept
-    // as "speech" (e.g. loud isolation residual) vs a gap VAD correctly dropped.
+    // Expose VAD speech regions (original timeline)
+    std::vector<transcribe::VadRegion> vad_segs;
+    int nv = whisper_full_n_vad_segments(ctx_);
+    vad_segs.reserve((size_t)(nv > 0 ? nv : 0));
+    for (int i = 0; i < nv; ++i)
+        vad_segs.push_back({ whisper_full_get_vad_segment_t0(ctx_, i) * 0.01,
+                             whisper_full_get_vad_segment_t1(ctx_, i) * 0.01 });
     if (opts.vad_regions) {
-        opts.vad_regions->clear();
-        int nv = whisper_full_n_vad_segments(ctx);
-        opts.vad_regions->reserve((size_t)(nv > 0 ? nv : 0));
-        for (int i = 0; i < nv; ++i)
-            opts.vad_regions->push_back({ whisper_full_get_vad_segment_t0(ctx, i) * 0.01,
-                                          whisper_full_get_vad_segment_t1(ctx, i) * 0.01 });
+        *opts.vad_regions = vad_segs;
     }
 
-    // Diagnostic: report the raw (pre-dedup) segment span. If this ends far short
-    // of the audio length, whisper stopped/stalled; if it reaches the end but the
-    // final SRT is short, the de-dup collapsed a repetition loop (both look like
-    // "it stopped early" to the user, but the cause and fix differ).
+    // VAD speech region containment:
+    // If a short subtitle cue spans across a removed silence gap between two VAD regions,
+    // Whisper forward-dated its end (or back-dated its start) across the cut-out gap.
+    if (!vad_segs.empty()) {
+        for (auto& s : out) {
+            if (s.t0 >= s.t1) continue;
+            int v_start = -1;
+            for (int v = 0; v < (int)vad_segs.size(); ++v) {
+                if (s.t0 >= vad_segs[v].t0 && s.t0 <= vad_segs[v].t1) {
+                    v_start = v;
+                    break;
+                }
+            }
+            if (v_start >= 0 && v_start + 1 < (int)vad_segs.size()) {
+                double gap = vad_segs[v_start + 1].t0 - vad_segs[v_start].t1;
+                if (gap > 0.80 && s.t1 > vad_segs[v_start].t1 + 0.20) {
+                    double vad_dur = vad_segs[v_start].t1 - s.t0;
+                    if (s.text.size() < 60 || s.text.size() / std::max(0.5, vad_dur) < 25.0) {
+                        s.t1 = std::min(s.t1, vad_segs[v_start].t1 + 0.150);
+                    }
+                }
+            }
+        }
+    }
+
+    // Acoustic onset and offset tightening:
+    // When whisper begins a cue during leading silence or vocal isolation residual,
+    // s.t0 can precede spoken dialogue. If audio energy at s.t0 is quiet (< -38 dBFS),
+    // scan forward in pcm for sustained voiced energy and snap s.t0 forward.
+    // Similarly, if a cue's end s.t1 extends into trailing silence (> 1.8s duration),
+    // scan backward to find where the speech finished so subtitles don't hang frozen on screen.
+    if (!pcm.empty() && !out.empty()) {
+        const int bin_n = 320; // 20ms @ 16kHz
+        const size_t n_bins = pcm.size() / bin_n;
+        std::vector<float> db_bins(n_bins, -90.0f);
+        for (size_t b = 0; b < n_bins; ++b) {
+            size_t offset = b * bin_n;
+            double sum = 0.0;
+            for (int k = 0; k < bin_n; ++k) {
+                float v = pcm[offset + k];
+                sum += (double)v * v;
+            }
+            double rms = std::sqrt(sum / bin_n);
+            db_bins[b] = (rms > 1e-9) ? (float)(20.0 * std::log10(rms)) : -90.0f;
+        }
+
+        for (auto& s : out) {
+            if (s.t0 >= s.t1) continue;
+            // Onset tightening:
+            int b_start = (int)(s.t0 / 0.020);
+            if (b_start >= 0 && b_start < (int)db_bins.size()) {
+                if (db_bins[b_start] < -38.0f) {
+                    int b_end = std::min((int)db_bins.size(), (int)(std::min(s.t1 - 0.10, s.t0 + 2.5) / 0.020));
+                    for (int b = b_start; b + 1 < b_end; ++b) {
+                        if (db_bins[b] >= -36.0f && db_bins[b + 1] >= -38.0f) {
+                            double onset = b * 0.020;
+                            double tightened = std::max(s.t0, onset - 0.050);
+                            if (tightened < s.t1 - 0.050) {
+                                s.t0 = tightened;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // Offset tightening:
+            int b_end = (int)(s.t1 / 0.020);
+            if (s.t1 - s.t0 > 1.8 && b_end >= 0 && b_end < (int)db_bins.size()) {
+                if (db_bins[b_end] < -38.0f) {
+                    int b_floor = std::max(0, (int)(s.t0 / 0.020));
+                    for (int b = b_end; b > b_floor; --b) {
+                        if (db_bins[b] >= -36.0f) {
+                            double offset_t = b * 0.020 + 0.150;
+                            double min_read_dur = std::min(2.5, 0.05 * s.text.size() + 0.80);
+                            double tightened_end = std::max(s.t0 + min_read_dur, offset_t);
+                            if (tightened_end < s.t1) {
+                                s.t1 = tightened_end;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure comfortable reading duration:
+    // A subtitle that flashes on screen for only 200-400ms is difficult to read.
+    // Extend end time up to standard reading duration (at least 1.0s, scaled by length),
+    // provided it does not collide with the next subtitle cue.
     double audio_sec = pcm.size() / 16000.0;
+    for (size_t k = 0; k < out.size(); ++k) {
+        if (out[k].t0 >= out[k].t1) continue;
+        double min_read = std::min(2.5, std::max(1.0, 0.04 * (double)out[k].text.size() + 0.60));
+        double target_end = std::max(out[k].t1, out[k].t0 + min_read);
+        if (k + 1 < out.size() && out[k + 1].t0 > out[k].t0) {
+            target_end = std::min(target_end, out[k + 1].t0 - 0.050);
+        }
+        if (audio_sec > 0.0) {
+            target_end = std::min(target_end, audio_sec);
+        }
+        if (target_end > out[k].t0 + 0.200) {
+            out[k].t1 = target_end;
+        }
+    }
+
+    // Diagnostic: report the raw (pre-dedup) segment span.
     if (!out.empty()) {
         logging::logf("INFO",
             "whisper: %d raw segments, span %.1fs..%.1fs of %.1fs audio (%.0f%% covered)",
@@ -202,8 +405,14 @@ bool run(const std::vector<float>& pcm, const Options& opts,
         logging::logf("WARN", "whisper: produced 0 segments for %.1fs audio", audio_sec);
     }
 
-    whisper_free(ctx);
     return true;
+}
+
+bool run(const std::vector<float>& pcm, const Options& opts,
+         std::vector<srt::Segment>& out, std::string& err) {
+    Session session;
+    if (!session.init(opts, err)) return false;
+    return session.transcribe(pcm, opts, out, err);
 }
 
 } // namespace transcribe

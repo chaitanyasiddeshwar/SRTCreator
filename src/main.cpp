@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -14,10 +15,22 @@
 #include "separate.h"
 #include "log.h"
 #include "debug.h"
+#include "timeline.h"
 
 namespace {
 
 const char* kDefaultModel = "large-v3-turbo-q8_0";
+
+std::string format_duration_hms(double seconds) {
+    if (seconds < 0.0) seconds = 0.0;
+    long long total_s = (long long)(seconds + 0.5);
+    long long h = total_s / 3600;
+    long long m = (total_s % 3600) / 60;
+    long long s = total_s % 60;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld", h, m, s);
+    return std::string(buf);
+}
 
 void usage() {
     std::printf(
@@ -34,10 +47,11 @@ void usage() {
         "      --audio-stream <n>   Audio stream index (default: best)\n"
         "      --duration <sec>     Only transcribe the first <sec> seconds\n"
         "      --no-flash-attn      Disable flash attention (on by default)\n"
-        "      --no-vad             Disable Silero VAD (on by default)\n"
         "      --no-center          Don't isolate the center channel (dialogue)\n"
-        "      --isolate-vocals     Remove music/effects with a separation model first\n"
         "      --vocal-model <name> Vocal model: Kim_Vocal_2 (default), etc.\n"
+        "      --no-infill          Disable Pass 3 targeted infill for missed speech\n"
+        "      --pause-split <sec>  Split cues across pauses >= <sec> (default: 1.5, 0=off)\n"
+        "      --timeline-json <path> Path to output timeline JSON (default: <output>.timeline.json)\n"
         "      --no-word-timestamps Disable DTW word timing (on by default; it\n"
         "                           snaps each cue to the actual spoken words)\n"
         "      --dump-audio [path]  Write the 16k mono audio whisper hears to a WAV\n"
@@ -82,9 +96,8 @@ int main(int argc, char** argv) {
 
     std::string input, output, model = kDefaultModel, language = "auto";
     std::string models_dir, download_name, threads_s, stream_s, duration_s, maxline_s;
-    bool translate = false, flash = true, vad = true, word_ts = true, verbose = false;
+    bool translate = false, flash = true, word_ts = true, verbose = false;
     bool center = true; // isolate Front-Center (dialogue) for multichannel sources
-    bool isolate = false;               // vocal isolation (music removal)
     std::string vocal_model = "Kim_Vocal_2";
     int max_line_length = 42; // Netflix-style default; 0 disables wrapping
     bool dump_audio = false;            // write the 16k mono whisper input to a WAV
@@ -92,6 +105,10 @@ int main(int argc, char** argv) {
     std::string offset_s;               // constant sync shift (seconds; +later, -earlier)
     bool debug = false;                 // write a timing diagnostic report
     std::string reference_path;         // optional reference SRT for the debug report
+    bool infill = true;                 // Pass 3 targeted infill for missed speech
+    double pause_split = 1.5;           // Pass 2 pause splitting threshold in seconds
+    std::string pause_split_s;
+    std::string timeline_json;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -105,12 +122,15 @@ int main(int argc, char** argv) {
         else if (a == "--max-line-length") { if (!take(argc, argv, i, "--max-line-length", maxline_s)) return 2; }
         else if (a == "--no-flash-attn")   flash = false;
         else if (a == "--flash-attn")      flash = true;
-        else if (a == "--no-vad")          vad = false;
-        else if (a == "--vad")             vad = true;
+        else if (a == "--no-vad" || a == "--vad") { /* VAD is always enabled */ }
         else if (a == "--no-center")       center = false;
         else if (a == "--center")          center = true;
-        else if (a == "--isolate-vocals" || a == "--vocals") isolate = true;
+        else if (a == "--isolate-vocals" || a == "--vocals") { /* Vocal isolation is always enabled */ }
         else if (a == "--vocal-model")     { if (!take(argc, argv, i, "--vocal-model", vocal_model)) return 2; }
+        else if (a == "--no-infill")       infill = false;
+        else if (a == "--infill")          infill = true;
+        else if (a == "--pause-split" || a == "--pause-split-threshold") { if (!take(argc, argv, i, a.c_str(), pause_split_s)) return 2; }
+        else if (a == "--timeline-json")   { if (!take(argc, argv, i, "--timeline-json", timeline_json)) return 2; }
         else if (a == "--word-timestamps") word_ts = true;
         else if (a == "--no-word-timestamps") word_ts = false;
         else if (a == "--dump-audio")      { dump_audio = true; if (i + 1 < argc && argv[i+1][0] != '-') dump_audio_path = argv[++i]; }
@@ -154,74 +174,77 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Note: VAD stays ON even when isolating. It was once disabled here (music is
-    // gone after separation), but without VAD whisper back-dates segment starts
-    // across silence gaps (cues appear seconds early) and falls into repetition
-    // loops on isolated-stem artifacts. Running Silero VAD on the isolated stem
-    // fixes both - it trims the leading silence so timing tracks the real onset.
-
-    // 2) VAD model (optional; disable gracefully if unavailable).
+    // 2) VAD model (always enabled).
     std::string vad_path;
-    if (vad) {
-        if (!models::ensure_vad(models_dir, /*allow_download=*/true, vad_path, err)) {
-            std::fprintf(stderr, "warning: VAD disabled (%s)\n", err.c_str());
-            vad = false;
-        }
+    if (!models::ensure_vad(models_dir, /*allow_download=*/true, vad_path, err)) {
+        std::fprintf(stderr, "error: VAD model required: %s\n", err.c_str());
+        return 1;
     }
 
-    logging::logf("INFO", "input=%s model=%s lang=%s translate=%d vad=%d wrap=%d",
+    logging::logf("INFO", "input=%s model=%s lang=%s translate=%d center=%d infill=%d wrap=%d",
                   input.c_str(), model_path.c_str(), language.c_str(),
-                  (int)translate, (int)vad, max_line_length);
+                  (int)translate, (int)center, (int)infill, max_line_length);
 
-    // 3) Decode audio (and optionally isolate vocals) -> 16 kHz mono f32.
+    // 3) Decode audio (44.1k stereo) and isolate vocals -> 16 kHz mono f32.
+    auto t_job_start = std::chrono::steady_clock::now();
+    double dur_phase1 = 0.0; // Audio extraction
+    double dur_phase2 = 0.0; // Voice isolation
+    double dur_phase3 = 0.0; // Speech transcription (Pass 1)
+    double dur_phase4 = 0.0; // Silence sanitization (Pass 2)
+    double dur_phase5 = 0.0; // Targeted audio infill (Pass 3)
+
     double maxsec = duration_s.empty() ? 0.0 : std::atof(duration_s.c_str());
     std::vector<float> pcm;
-    if (isolate) {
-        std::fprintf(stderr, "[srt] decoding (44.1k stereo for separation): %s\n", input.c_str());
-        logging::info("decoding for separation");
-        audio::DecodeOptions d;
-        d.sample_rate = 44100; d.channels = 2;
-        d.stream_index = stream; d.max_seconds = maxsec; d.center_channel_only = center;
-        std::vector<float> mix;
-        if (!audio::decode(input, d, mix, err)) {
-            logging::error("decode failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
-        }
-        std::string mpath; separate::Params sp;
-        if (!separate::ensure_model(vocal_model, models_dir, true, mpath, sp, err)) {
-            logging::error("vocal model: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
-        }
-        std::fprintf(stderr, "[srt] isolating vocals (%s) ...\n", vocal_model.c_str());
-        logging::logf("INFO", "isolating vocals with %s", vocal_model.c_str());
-        std::vector<float> vocals;
-        if (!separate::isolate_vocals(mix, mpath, sp, vocals, nullptr, err)) {
-            logging::error("separation failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
-        }
-        std::vector<float>().swap(mix); // free the 44.1k stereo mix before resampling
-        if (!audio::resample_to_mono(vocals, 44100, 1, 16000, pcm, err)) {
-            logging::error("resample failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
-        }
-    } else {
-        std::fprintf(stderr, "[srt] decoding audio: %s\n", input.c_str());
-        logging::info("decoding audio");
-        audio::DecodeOptions dopts;
-        dopts.stream_index = stream; dopts.max_seconds = maxsec; dopts.center_channel_only = center;
-        if (!audio::decode(input, dopts, pcm, err)) {
-            logging::error("decode failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
-        }
-    }
-    std::fprintf(stderr, "[srt] audio ready: %.1f min\n", pcm.size() / 16000.0 / 60.0);
-    logging::logf("INFO", "audio ready %.1f min (%zu samples)", pcm.size() / 16000.0 / 60.0, pcm.size());
 
-    // Optional: dump the exact 16 kHz mono audio whisper will hear (the isolated
-    // vocal stem when --isolate-vocals). ONLY when --dump-audio is given - we never
-    // need this file internally, so isolating alone must not leave one behind.
-    // Default location is next to the input.
+    std::fprintf(stderr, "[srt] decoding (44.1k stereo for separation): %s\n", input.c_str());
+    logging::info("decoding for separation");
+    audio::DecodeOptions d;
+    d.sample_rate = 44100; d.channels = 2;
+    d.stream_index = stream; d.max_seconds = maxsec; d.center_channel_only = center;
+    std::vector<float> mix;
+    auto t_p1_start = std::chrono::steady_clock::now();
+    if (!audio::decode(input, d, mix, err)) {
+        logging::error("decode failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+    }
+    auto t_p1_end = std::chrono::steady_clock::now();
+    dur_phase1 = std::chrono::duration<double>(t_p1_end - t_p1_start).count();
+    logging::logf("INFO", "Phase 1 (Audio extraction) completed in %s (%.2fs)",
+                  format_duration_hms(dur_phase1).c_str(), dur_phase1);
+    std::fprintf(stderr, "[timing] Phase 1 (Audio extraction): %s\n", format_duration_hms(dur_phase1).c_str());
+
+    std::string mpath; separate::Params sp;
+    if (!separate::ensure_model(vocal_model, models_dir, true, mpath, sp, err)) {
+        logging::error("vocal model: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+    }
+    std::fprintf(stderr, "[srt] isolating vocals (%s) ...\n", vocal_model.c_str());
+    logging::logf("INFO", "isolating vocals with %s", vocal_model.c_str());
+    std::vector<float> vocals;
+    auto t_p2_start = std::chrono::steady_clock::now();
+    if (!separate::isolate_vocals(mix, mpath, sp, vocals, nullptr, err)) {
+        logging::error("separation failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+    }
+    std::vector<float>().swap(mix); // free the 44.1k stereo mix before resampling
+    if (!audio::resample_to_mono(vocals, 44100, 1, 16000, pcm, err)) {
+        std::vector<float>().swap(vocals);
+        logging::error("resample failed: " + err); std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+    }
+    std::vector<float>().swap(vocals); // IMMEDIATELY free 44.1k mono vocals (~1.6GB)
+    auto t_p2_end = std::chrono::steady_clock::now();
+    dur_phase2 = std::chrono::duration<double>(t_p2_end - t_p2_start).count();
+    logging::logf("INFO", "Phase 2 (Voice isolation) completed in %s (%.2fs)",
+                  format_duration_hms(dur_phase2).c_str(), dur_phase2);
+    std::fprintf(stderr, "[timing] Phase 2 (Voice isolation): %s\n", format_duration_hms(dur_phase2).c_str());
+
+    std::fprintf(stderr, "[srt] isolated audio ready: %.1f min\n", pcm.size() / 16000.0 / 60.0);
+    logging::logf("INFO", "isolated audio ready %.1f min (%zu samples)", pcm.size() / 16000.0 / 60.0, pcm.size());
+
+    // Optional: dump audio (vocals)
     if (dump_audio) {
         std::string wav = dump_audio_path;
         if (wav.empty()) {
             size_t dot = input.find_last_of('.');
             std::string base = (dot == std::string::npos) ? input : input.substr(0, dot);
-            wav = base + (isolate ? ".vocals16k.wav" : ".whisper16k.wav");
+            wav = base + ".vocals16k.wav";
         }
         std::string werr;
         if (audio::write_wav(wav, pcm, 16000, 1, werr)) {
@@ -240,26 +263,87 @@ int main(int argc, char** argv) {
     topts.language        = language;
     topts.translate       = translate;
     topts.flash_attn      = flash;
-    topts.vad             = vad;
+    topts.vad             = true;
     topts.vad_model_path  = vad_path;
     topts.threads         = threads;
     topts.word_timestamps = word_ts;
     topts.verbose         = verbose;
     std::vector<transcribe::VadRegion> vad_regions;
-    if (debug) topts.vad_regions = &vad_regions;
+    topts.vad_regions     = &vad_regions;
 
     logging::info("transcribing");
     std::vector<srt::Segment> segments;
-    if (!transcribe::run(pcm, topts, segments, err)) {
-        logging::error("transcribe failed: " + err);
+    transcribe::Session session;
+    auto t_p3_start = std::chrono::steady_clock::now();
+    if (!session.init(topts, err)) {
+        logging::error("whisper init failed: " + err);
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
-    logging::logf("INFO", "transcribed %zu segments", segments.size());
+    if (!session.transcribe(pcm, topts, segments, err)) {
+        logging::error("transcribe failed: " + err);
+        session.close();
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    auto t_p3_end = std::chrono::steady_clock::now();
+    dur_phase3 = std::chrono::duration<double>(t_p3_end - t_p3_start).count();
+    logging::logf("INFO", "Phase 3 (Transcription) completed in %s (%.2fs)",
+                  format_duration_hms(dur_phase3).c_str(), dur_phase3);
+    std::fprintf(stderr, "[timing] Phase 3 (Transcription): %s\n", format_duration_hms(dur_phase3).c_str());
+    logging::logf("INFO", "transcribed %zu raw segments", segments.size());
 
-    // Optional constant sync shift. Whisper's segment timestamps can lead or lag
-    // the true audio (typically ~0.4s in the VAD path); this lets the user nudge
-    // every cue by a fixed amount. Positive = later, negative = earlier.
+    // Pass 2: Sanitize cues & split mid-sentence pauses against timeline
+    size_t orig_cue_count = segments.size();
+    size_t dot_pos = output.find_last_of('.');
+    std::string json_path = timeline_json.empty()
+        ? ((dot_pos == std::string::npos ? output : output.substr(0, dot_pos)) + ".timeline.json")
+        : timeline_json;
+
+    timeline::TimelineMap tl_map;
+    if (!vad_regions.empty()) {
+        std::fprintf(stderr, "[srt] Pass 2: Sanitizing cues against timeline...\n");
+        auto t_p4_start = std::chrono::steady_clock::now();
+        tl_map = timeline::build_timeline(input, pcm, vad_regions);
+        timeline::sanitize_and_split(segments, tl_map, pause_split);
+        timeline::find_missing_vocal_regions(segments, tl_map, 0.8, 0.20);
+        auto t_p4_end = std::chrono::steady_clock::now();
+        dur_phase4 = std::chrono::duration<double>(t_p4_end - t_p4_start).count();
+        logging::logf("INFO", "Phase 4 (Silence sanitization) completed in %s (%.2fs)",
+                      format_duration_hms(dur_phase4).c_str(), dur_phase4);
+        std::fprintf(stderr, "[timing] Phase 4 (Silence sanitization): %s\n", format_duration_hms(dur_phase4).c_str());
+
+        auto ac_p2 = timeline::count_actions(tl_map);
+        logging::logf("INFO", "Pass 2 sanitation: %d actions applied (cues: %zu -> %zu)",
+                      ac_p2.total(), orig_cue_count, segments.size());
+        std::fprintf(stderr, "[srt] Pass 2 applied %d timing fixes (cues: %zu -> %zu)\n",
+                     ac_p2.total(), orig_cue_count, segments.size());
+
+        if (infill && !tl_map.missing_vocal.empty()) {
+            std::fprintf(stderr, "[srt] Pass 3: Infilling %zu missed speech regions...\n", tl_map.missing_vocal.size());
+            auto t_p5_start = std::chrono::steady_clock::now();
+            timeline::infill_missing_regions(pcm, session, topts, tl_map, segments, [](const std::string& msg) {
+                std::fprintf(stderr, "  [infill] %s\n", msg.c_str());
+            });
+            auto t_p5_end = std::chrono::steady_clock::now();
+            dur_phase5 = std::chrono::duration<double>(t_p5_end - t_p5_start).count();
+            logging::logf("INFO", "Phase 5 (Targeted audio infill) completed in %s (%.2fs)",
+                          format_duration_hms(dur_phase5).c_str(), dur_phase5);
+            std::fprintf(stderr, "[timing] Phase 5 (Targeted audio infill): %s\n", format_duration_hms(dur_phase5).c_str());
+        }
+
+        std::string jerr;
+        if (timeline::write_json(tl_map, json_path, jerr)) {
+            logging::info("wrote timeline json: " + json_path);
+            std::fprintf(stderr, "[srt] wrote timeline analysis: %s\n", json_path.c_str());
+        } else {
+            logging::error("failed to write timeline json: " + jerr);
+        }
+    }
+
+    session.close(); // explicitly release Whisper model and reset CUDA device memory
+
+    // Optional constant sync shift.
     double time_offset = offset_s.empty() ? 0.0 : std::atof(offset_s.c_str());
     if (time_offset != 0.0) {
         for (auto& s : segments) {
@@ -278,6 +362,55 @@ int main(int argc, char** argv) {
     logging::logf("INFO", "wrote %zu segments to %s", segments.size(), output.c_str());
     std::printf("wrote %zu segments to %s\n", segments.size(), output.c_str());
 
+    auto t_job_end = std::chrono::steady_clock::now();
+    double dur_total = std::chrono::duration<double>(t_job_end - t_job_start).count();
+    auto ac = timeline::count_actions(tl_map);
+
+    logging::logf("INFO", "Timing Summary: 1.Audio extraction=%s (%.2fs) | 2.Voice isolation=%s (%.2fs) | 3.Transcription=%s (%.2fs) | 4.Silence sanitize=%s (%.2fs) | 5.Targeted infill=%s | Total=%s (%.2fs)",
+                  format_duration_hms(dur_phase1).c_str(), dur_phase1,
+                  format_duration_hms(dur_phase2).c_str(), dur_phase2,
+                  format_duration_hms(dur_phase3).c_str(), dur_phase3,
+                  format_duration_hms(dur_phase4).c_str(), dur_phase4,
+                  infill ? (tl_map.missing_vocal.empty() ? "N/A (0 missed)" : (format_duration_hms(dur_phase5) + " (" + std::to_string((int)dur_phase5) + "s)").c_str()) : "N/A (disabled)",
+                  format_duration_hms(dur_total).c_str(), dur_total);
+
+    logging::logf("INFO", "Post-Processing Summary: Vocal coverage=%.1f%% (%.1fs vocal / %.1fs silence) | Pass 2 fixes=%d (clamped=%d, snapped=%d, split=%d, dropped=%d) | Pass 2.5 missed gaps=%zu | Pass 3 infilled=%d",
+                  tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
+                  ac.total() - ac.infilled, ac.clamped, ac.snapped, ac.split, ac.dropped,
+                  tl_map.missing_vocal.size(), ac.infilled);
+
+    std::fprintf(stderr,
+                 "\n----------------------------------------\n"
+                 "Timing Summary:\n"
+                 "  1. Audio extraction:      %s\n"
+                 "  2. Voice isolation:       %s\n"
+                 "  3. Speech transcription:  %s\n"
+                 "  4. Silence sanitization:  %s\n"
+                 "  5. Targeted audio infill: %s\n"
+                 "  Total time taken:         %s\n"
+                 "----------------------------------------\n"
+                 "Post-Processing Summary (Pass 2 & 3):\n"
+                 "  Vocal coverage:    %.1f%% (%.1fs vocal / %.1fs silence)\n"
+                 "  Cues processed:    %zu -> %zu\n"
+                 "  Pass 2 fixes:      %d applied\n"
+                 "    - Clamped trailing:   %d\n"
+                 "    - Snapped leading:    %d\n"
+                 "    - Split pauses:       %d\n"
+                 "    - Dropped halluc.:    %d\n"
+                 "  Missed vocal gaps: %zu detected\n"
+                 "  Pass 3 infilled:   %d recovered cues\n"
+                 "----------------------------------------\n\n",
+                 format_duration_hms(dur_phase1).c_str(),
+                 format_duration_hms(dur_phase2).c_str(),
+                 format_duration_hms(dur_phase3).c_str(),
+                 format_duration_hms(dur_phase4).c_str(),
+                 infill ? (tl_map.missing_vocal.empty() ? "00:00:00 (0 missed)" : format_duration_hms(dur_phase5).c_str()) : "N/A (disabled)",
+                 format_duration_hms(dur_total).c_str(),
+                 tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
+                 orig_cue_count, segments.size(),
+                 ac.total() - ac.infilled, ac.clamped, ac.snapped, ac.split, ac.dropped,
+                 tl_map.missing_vocal.size(), ac.infilled);
+
     // 6) Optional timing diagnostics (--debug): correlate VAD regions, whisper
     // cues, actual audio energy, and an optional reference SRT.
     if (debug) {
@@ -290,7 +423,7 @@ int main(int argc, char** argv) {
                               reference_path.c_str(), rerr.c_str());
         }
         debugreport::Info di;
-        di.model = model; di.isolate = isolate; di.center = center; di.vad = vad; di.word_ts = word_ts;
+        di.model = model; di.isolate = true; di.center = center; di.vad = true; di.word_ts = word_ts;
         std::string dbg_path = output + ".debug.txt";
         std::string derr;
         if (debugreport::write(dbg_path, pcm, segments, vad_regions, refp, di, derr)) {
@@ -300,5 +433,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "warning: debug report failed (%s)\n", derr.c_str());
         }
     }
+
+    std::vector<float>().swap(pcm);
+    std::vector<srt::Segment>().swap(segments);
+    std::vector<transcribe::VadRegion>().swap(vad_regions);
+    tl_map.intervals.clear(); tl_map.intervals.shrink_to_fit();
+    tl_map.actions.clear(); tl_map.actions.shrink_to_fit();
+    tl_map.missing_vocal.clear(); tl_map.missing_vocal.shrink_to_fit();
+
     return 0;
 }

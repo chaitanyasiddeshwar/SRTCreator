@@ -22,18 +22,18 @@ On an RTX 3080 Ti it transcribes roughly **70× faster than real time**
 ## Features
 
 - **Any input** — MP4, MKV, AVI, TS, MOV, WebM, … with AAC, AC3/E-AC3, DTS,
-  TrueHD, Opus, FLAC, MP3, PCM and more (multichannel audio is downmixed to mono).
-- **GPU-accelerated** whisper `large-v3-turbo` (quantized) with flash attention.
-- **Automatic language detection.**
-- **Translation** — transcribe a non-English film straight to English subtitles
-  (`--translate`).
-- **Voice Activity Detection (VAD)** to skip music/silence (on by default).
+  TrueHD, Opus, FLAC, MP3, PCM and more (multichannel audio uses dialogue front-center extraction).
+- **GPU-accelerated vocal isolation (always-on)** — MDX-Net model (Kim_Vocal_2 via DirectML)
+  strips musical score and heavy background sound before transcription.
+- **Whisper ASR with Silero VAD (always-on)** — `large-v3-turbo` with flash attention
+  and Silero VAD prevents repetition loops and cuts non-speech hallucinations.
+- **3-Pass Timing & Quality Pipeline**:
+  - **Pass 1: Speech Transcription** — Whisper ASR with acoustic onset/offset tightening and DTW word-level timing.
+  - **Pass 2: Silence Sanitization & Timeline Mapping** — Generates a timeline JSON partitioning the audio into alternating `silence` and `vocal` intervals; clamps trailing ends over silence, snaps leading starts to true speech onset, splits cues across mid-sentence pauses (≥ 1.5s), and prunes pure silence hallucinations.
+  - **Pass 3: Targeted Audio Infill** — Automatically detects vocal intervals lacking subtitle coverage and re-transcribes them using high-speed, single-session GPU inference to recover missed dialogue.
+- **Per-Phase Timing & Summaries** — Detailed runtime logs in `hh:mm:ss` for all 5 phases (Audio extraction, Voice isolation, Transcription, Silence sanitization, Targeted infill) and comprehensive post-processing statistics.
+- **Automatic language detection & Translation** (`--translate`).
 - **Readable line wrapping** (Netflix-style 42 chars/line by default).
-- **Hallucination de-duplication** — whisper tends to loop the same line over
-  music/ambiguous audio; repeated cues (even alternating or lightly re-punctuated)
-  are collapsed automatically.
-- **Debug aids** — dump the exact audio whisper hears (`--dump-audio`) and nudge
-  subtitle sync (`--time-offset`).
 - **Self-contained** — models download automatically on first use.
 
 ---
@@ -47,35 +47,33 @@ On an RTX 3080 Ti it transcribes roughly **70× faster than real time**
    ```
    srt.exe "C:\path\to\movie.mkv"
    ```
-   The first run downloads the speech model (~830 MB) and the VAD model into
-   `%LOCALAPPDATA%\SRTCreator\models`. Subsequent runs are instant to start.
+   The first run downloads the speech model (~830 MB), VAD model, and vocal isolation model into
+   `%LOCALAPPDATA%\SRTCreator\models`. Subsequent runs start instantly.
 
-The subtitle file is written next to the input (`movie.srt`) unless you pass
+The subtitle file is written next to the input (`movie.srt`) along with `<input>.timeline.json` unless you pass
 `-o`.
 
 ---
 
 ## GUI (drag-and-drop)
 
-`srtgui.exe` is a minimal window: **drag a media file onto it** and it decodes,
-transcribes, shows the subtitles live in a panel with a progress bar, and saves
-`<input>.srt` next to the file. All the main options are checkboxes/dropdowns:
+`srtgui.exe` is a clean, minimal window: **drag a media file onto it** and it decodes,
+isolates vocals, transcribes, sanitizes against timeline silence, infills missed dialogue,
+and saves `<input>.srt` and `<input>.timeline.json` next to the file.
 
-- Checkboxes: **Translate → English**, **VAD**, **Flash attention**,
-  **Word timestamps**, **Wrap lines (42)**, **Center channel (dialogue)**,
-  **Isolate vocals (remove music)**, **Dump audio (debug)**
-- Dropdowns: **Model**, **Language**, and **Vocal** (separation model)
+- **Checkboxes**:
+  - **Translate → English** — translate foreign audio to English subtitles.
+  - **Flash attention** — fused flash attention CUDA kernels (on by default).
+  - **Word timestamps** — DTW word-level acoustic alignment (on by default).
+  - **Wrap lines (42)** — Netflix-style character wrap limit.
+  - **Center channel (dialogue)** — front-center channel extraction for 5.1/7.1 audio.
+  - **Infill speech (Pass 3)** — targeted re-transcription of missed vocal regions (on by default).
+  - **Dump audio (debug)** — export the 16 kHz isolated vocal stem (`<name>.vocals16k.wav`).
+- **Dropdowns**: **Model** (Whisper), **Language**, and **Vocal** (Kim_Vocal_2 default).
+- **Live scrolling transcript panel**: Displays real-time decoding, per-phase timing (`hh:mm:ss`),
+  infilled cue alerts, and complete Post-Processing Summary.
 
-> **Dump audio (debug)** saves the exact 16 kHz mono track whisper transcribes
-> next to the input (`<name>.whisper16k.wav`, or `<name>.vocals16k.wav` when
-> isolating vocals) so you can hear precisely what the model heard.
-
-> **Vocal isolation** (optional) removes music/effects before transcribing, which
-> helps dialogue buried under a score. It's GPU-accelerated but adds a few minutes
-> and is best for music-heavy content; plain transcription is the fast default.
-
-No console needed — just double-click `srtgui.exe`. (First run may briefly show a
-console window while a model downloads.)
+No console needed — just double-click `srtgui.exe`.
 
 ## Usage (CLI)
 
@@ -92,56 +90,46 @@ srt <input> [options]
 | `-o, --output <path>` | `<input>.srt` | Where to write the SRT file. |
 | `-m, --model <name\|path>` | `large-v3-turbo-q8_0` | Model name (e.g. `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`, optionally with a quant suffix like `-q8_0`/`-q5_1`), **or** a path to a `.bin`/`.gguf` file. Named models auto-download. |
 | `-l, --language <code>` | `auto` | Source language as an ISO code (`en`, `es`, `fr`, `de`, `ja`, …) or `auto` to detect. |
-| `--translate` | off | Translate speech to **English** subtitles (works with `auto` — detects the source language, writes English). Requires a multilingual model (the default is fine; `.en` models can't translate). |
-| `--audio-stream <n>` | best | Pick a specific audio stream index (for files with multiple audio tracks). Use `ffprobe` to list them. |
+| `--translate` | off | Translate speech to **English** subtitles (works with `auto`). Requires a multilingual model. |
+| `--audio-stream <n>` | best | Pick a specific audio stream index (for files with multiple audio tracks). |
 | `--duration <sec>` | whole file | Only transcribe the first `<sec>` seconds. Handy for a quick preview/test. |
-| `--max-line-length <n>` | `42` | Wrap subtitle text to at most `n` characters per line (balanced across two lines when it fits). `0` disables wrapping. |
-| `--no-vad` | VAD on | Disable Voice Activity Detection. VAD skips non-speech and is recommended; disable only to debug. |
-| `--no-center` | center on | Don't isolate the Front-Center channel. By default, for 5.1/7.1 sources the center channel (dialogue) is used instead of a full downmix. |
-| `--isolate-vocals` | off | Remove music/effects with a separation model (MDX-Net, GPU) before transcribing. Helps dialogue over score; slower (~minutes) and off by default. |
+| `--max-line-length <n>` | `42` | Wrap subtitle text to at most `n` characters per line. `0` disables wrapping. |
+| `--no-center` | center on | Don't isolate the Front-Center channel. By default, 5.1/7.1 mixes extract the dialogue center channel. |
 | `--vocal-model <name>` | Kim_Vocal_2 | Separation model: `Kim_Vocal_2`, `UVR-MDX-NET-Inst_HQ_3`, `UVR_MDXNET_KARA_2`. |
+| `--no-infill` | infill on | Disable Pass 3 targeted audio infill for missed vocal regions. |
+| `--pause-split <sec>` | `1.5` | Silence duration threshold in seconds to split a mid-sentence cue in Pass 2. |
+| `--timeline-json <path>` | `<output>.timeline.json` | Explicit path for the timeline intervals and actions JSON export. |
 | `--no-flash-attn` | flash on | Disable flash attention (rarely needed). |
-| `--no-word-timestamps` | word-ts on | Disable DTW word-level timing. It's **on by default**: each cue is snapped to the actual spoken words (via whisper's DTW), which fixes cues that would otherwise appear early. Costs ~5%. |
-| `--time-offset <sec>` | `0` | Shift every cue by a constant (`+` later, `-` earlier). Use to fix a consistent sync lead/lag (see [Debugging sync](#debugging-sync--audio)). |
-| `--dump-audio [path]` | off | Write the exact 16 kHz mono audio whisper hears to a WAV (the isolated vocal stem with `--isolate-vocals`). Auto-on when isolating. Lands next to `srt.exe` if no path is given. |
+| `--no-word-timestamps` | word-ts on | Disable DTW word-level timing alignment. |
+| `--time-offset <sec>` | `0` | Shift every cue by a constant (`+` later, `-` earlier). |
+| `--dump-audio [path]` | off | Export the exact 16 kHz isolated vocal audio fed to Whisper as a WAV. |
 | `--threads <n>` | auto | CPU worker threads for pre/post-processing. |
 | `--models-dir <path>` | `%LOCALAPPDATA%\SRTCreator\models` | Where models are stored/downloaded. |
 | `--download <name>` | — | Download a model and exit (e.g. `srt --download large-v3`). |
-| `--verbose` | off | Print whisper progress and detail. |
+| `--debug` | off | Write a detailed timing diagnostics report (`<output>.debug.txt`). |
+| `--verbose` | off | Print verbose progress and Whisper internals. |
 | `-h, --help` | — | Show help. |
 
 ### Examples
 
 ```bat
-:: Basic - auto language, default model, VAD + wrapping on
+:: Basic - vocal isolation, Whisper large-v3-turbo, VAD, 3-pass pipeline
 srt "D:\Movies\movie.mkv"
 
 :: Non-English film -> English subtitles
 srt "D:\Movies\film.fr.mkv" --translate
 
-:: Force a language (skips detection; a touch faster / more reliable)
-srt movie.mp4 -l en
-
-:: Maximum accuracy with the full large-v3 model
-srt movie.mp4 -m large-v3
-
 :: Quick 2-minute preview
 srt movie.mp4 --duration 120 -o preview.srt
 
-:: Custom output path and wider lines
-srt movie.mp4 -o subs\movie.srt --max-line-length 50
+:: Adjust mid-sentence pause split threshold to 2.0s
+srt movie.mkv --pause-split 2.0
 
-:: Pick the second audio track
-srt movie.mkv --audio-stream 2
+:: Custom output and timeline paths
+srt movie.mp4 -o subs\movie.srt --timeline-json subs\analysis.json
 
-:: Pre-download a model
-srt --download large-v3-turbo-q8_0
-
-:: Nudge subtitles 0.4s later if they appear early
-srt movie.mkv --time-offset 0.4
-
-:: Isolate vocals and keep the isolated audio to inspect what whisper heard
-srt movie.mkv --isolate-vocals --dump-audio
+:: Nudge subtitles 0.3s later if there is an external delay
+srt movie.mkv --time-offset 0.3
 ```
 
 ### Debugging sync & audio
@@ -160,12 +148,10 @@ Two flags help when subtitles feel out of sync or the transcription looks wrong:
   subtitles with `ffmpeg -i movie.mkv -map 0:s:m:language:eng -c:s srt ref.srt` and
   diff the timings.
 
-Sync accuracy comes mainly from two things, both on by default: **VAD** (trims
-non-speech so cue starts track the real onset) and **DTW word timing** (snaps each
-cue to its actual first/last word). A residual case remains: **vocal isolation**
-can leave loud non-speech artifacts in gaps that both VAD and DTW mistake for
-speech, so a cue there may still start early. That's an isolation-quality limit,
-not a timing bug — plain (non-isolation) transcription is unaffected.
+Sync fidelity is maintained through the automated 3-pass pipeline:
+1. **Pass 1 Acoustic Alignment**: Silero VAD caps speech chunks, and cross-attention DTW pins each cue to spoken word tokens.
+2. **Pass 2 Silence Sanitization & Timeline Enforcement**: Subtitles are cross-referenced with the audio timeline. Cues that start prematurely are snapped forward to the true vocal onset, cues lingering into silence are clamped, cues bridging across a silent pause ≥ 1.5s are split into natural sub-phrases, and zero-energy hallucinations are pruned.
+3. **Pass 3 Targeted Audio Infill**: Any speech region that was skipped or compressed during the initial transcription pass is re-analyzed and infilled directly using single-session GPU inference.
 
 ### Models
 
