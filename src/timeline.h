@@ -78,6 +78,21 @@ int eliminate_boundary_bleeds(std::vector<srt::Segment>& segments,
                               const transcribe::Options& base_opts,
                               std::function<void(const std::string&)> on_log = nullptr);
 
+// Pass 2 (pre-step): Global repetition-loop suppression. Whisper can lock into a
+// hallucination loop, emitting one mutated line hundreds of times across the whole
+// film (e.g. "Ramin Ares, defender of Master Control." x1700). The windowed SRT
+// dedup only catches repeats within a few cues, so a spread-out loop survives AND
+// its regions look "covered" to Pass 2.5, hiding the real dialogue underneath.
+// This removes every cue whose exact normalized text (>= min_words words) appears
+// more than max_repeats times, leaving those vocal regions uncovered so Pass 2.5
+// flags them and Pass 3 re-transcribes them in isolation (which decodes cleanly,
+// without the VAD-seam that spawned the loop). Returns the number of cues removed.
+int suppress_repetition_loops(std::vector<srt::Segment>& segments,
+                              TimelineMap& map,
+                              int max_repeats = 8,
+                              int min_words = 3,
+                              std::function<void(const std::string&)> on_log = nullptr);
+
 // Pass 2: Sanitize subtitle cues against the timeline map:
 // - Clamps trailing ends that linger across silence
 // - Snaps leading starts that start prematurely in silence
@@ -121,7 +136,8 @@ struct ActionCounts {
     int bleeds_pruned = 0;
     int infilled = 0;
     int reanchored = 0;
-    int total() const { return clamped + snapped + split + dropped + bleeds_pruned + infilled + reanchored; }
+    int loops_dropped = 0;
+    int total() const { return clamped + snapped + split + dropped + bleeds_pruned + infilled + reanchored + loops_dropped; }
 };
 
 ActionCounts count_actions(const TimelineMap& map);

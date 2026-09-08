@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 
 namespace timeline {
 
@@ -326,6 +327,63 @@ int eliminate_boundary_bleeds(std::vector<srt::Segment>& segments,
         return 0;
     }
     return eliminate_boundary_bleeds(segments, map, pcm, session, base_opts, on_log);
+}
+
+int suppress_repetition_loops(std::vector<srt::Segment>& segments,
+                              TimelineMap& map,
+                              int max_repeats,
+                              int min_words,
+                              std::function<void(const std::string&)> on_log) {
+    if (segments.size() < (size_t)std::max(2, max_repeats)) return 0;
+
+    // Frequency of each cue's normalized text (lowercased, alnum words joined).
+    std::unordered_map<std::string, int> freq;
+    std::vector<std::string> norm(segments.size());
+    for (size_t i = 0; i < segments.size(); ++i) {
+        auto words = extract_clean_words(segments[i].text);
+        if ((int)words.size() < min_words) continue; // too short to be a loop signature
+        std::string key = join_words(words, 0, words.size());
+        norm[i] = key;
+        freq[key]++;
+    }
+
+    // A normalized phrase repeated more than max_repeats times across the whole
+    // film is a hallucination loop - real dialogue essentially never does this.
+    std::vector<srt::Segment> out;
+    out.reserve(segments.size());
+    int removed = 0;
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const std::string& key = norm[i];
+        if (!key.empty() && freq[key] > max_repeats) {
+            Action act;
+            act.cue_index = (int)i + 1;
+            act.action_type = "drop_repetition_loop";
+            act.orig_t0 = segments[i].t0; act.orig_t1 = segments[i].t1;
+            act.new_t0 = 0.0; act.new_t1 = 0.0;
+            act.text = segments[i].text;
+            act.reason = "repetition-loop hallucination (line seen " +
+                         std::to_string(freq[key]) + "x across film)";
+            map.actions.push_back(act);
+            removed++;
+            continue; // drop
+        }
+        out.push_back(std::move(segments[i]));
+    }
+
+    if (removed > 0) {
+        segments = std::move(out);
+        // Report the worst offenders once, not per-cue (there can be thousands).
+        std::string worst; int worst_n = 0;
+        for (const auto& kv : freq) if (kv.second > max_repeats && kv.second > worst_n) { worst_n = kv.second; worst = kv.first; }
+        if (on_log) {
+            on_log("Suppressed " + std::to_string(removed) +
+                   " repetition-loop cues (e.g. \"" + worst.substr(0, 48) + "\" x" +
+                   std::to_string(worst_n) + ") - regions queued for Pass 3 re-transcription");
+        }
+        logging::logf("INFO", "Pass 2: suppressed %d repetition-loop cues (worst: '%s' x%d)",
+                      removed, worst.c_str(), worst_n);
+    }
+    return removed;
 }
 
 bool sanitize_and_split(std::vector<srt::Segment>& segments,
@@ -731,6 +789,7 @@ ActionCounts count_actions(const TimelineMap& map) {
         else if (a.action_type == "prune_boundary_bleed") ac.bleeds_pruned++;
         else if (a.action_type == "infill_recovered") ac.infilled++;
         else if (a.action_type == "reanchor_displaced") ac.reanchored++;
+        else if (a.action_type == "drop_repetition_loop") ac.loops_dropped++;
     }
     return ac;
 }

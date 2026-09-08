@@ -1,0 +1,4 @@
+# Generated regression artifacts (reproducible via BASELINE.md steps); keep only the doc.
+*.debug.txt
+*.metrics.json
+*.timeline.json

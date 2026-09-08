@@ -305,6 +305,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[srt] Pass 2: Sanitizing cues against timeline...\n");
         auto t_p4_start = std::chrono::steady_clock::now();
         tl_map = timeline::build_timeline(input, pcm, vad_regions);
+        // Pre-step: remove whole-film repetition-loop hallucinations so their vocal
+        // regions read as uncovered and get re-transcribed cleanly by Pass 3.
+        timeline::suppress_repetition_loops(segments, tl_map, 8, 3, [](const std::string& msg) {
+            std::fprintf(stderr, "  [loop-suppress] %s\n", msg.c_str());
+        });
         timeline::eliminate_boundary_bleeds(segments, tl_map, pcm, session, topts, [](const std::string& msg) {
             std::fprintf(stderr, "  [boundary-bleed] %s\n", msg.c_str());
         });
@@ -396,6 +401,7 @@ int main(int argc, char** argv) {
                  "  Vocal coverage:    %.1f%% (%.1fs vocal / %.1fs silence)\n"
                  "  Cues processed:    %zu -> %zu\n"
                  "  Pass 2 fixes:      %d applied\n"
+                 "    - Loop cues dropped:  %d\n"
                  "    - Pruned bleeds:      %d\n"
                  "    - Clamped trailing:   %d\n"
                  "    - Snapped leading:    %d\n"
@@ -413,7 +419,7 @@ int main(int argc, char** argv) {
                  format_duration_hms(dur_total).c_str(),
                  tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
                  orig_cue_count, segments.size(),
-                 ac.total() - ac.infilled - ac.reanchored, ac.bleeds_pruned, ac.clamped, ac.snapped, ac.split, ac.dropped,
+                 ac.total() - ac.infilled - ac.reanchored, ac.loops_dropped, ac.bleeds_pruned, ac.clamped, ac.snapped, ac.split, ac.dropped,
                  tl_map.missing_vocal.size(), ac.infilled, ac.reanchored);
 
     // 6) Optional timing diagnostics (--debug): correlate VAD regions, whisper
