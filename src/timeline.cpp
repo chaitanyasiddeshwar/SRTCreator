@@ -69,6 +69,44 @@ std::string join_words(const std::vector<std::string>& w, size_t from, size_t to
     return s;
 }
 
+std::vector<std::string> extract_clean_words(const std::string& text) {
+    std::vector<std::string> words;
+    std::string w;
+    for (char c : text) {
+        if (std::isalnum((unsigned char)c)) {
+            w.push_back((char)std::tolower((unsigned char)c));
+        } else {
+            if (!w.empty()) {
+                words.push_back(w);
+                w.clear();
+            }
+        }
+    }
+    if (!w.empty()) words.push_back(w);
+    return words;
+}
+
+bool is_text_in_slice(const std::string& text_b, const std::string& text_slice) {
+    auto wb = extract_clean_words(text_b);
+    auto ws = extract_clean_words(text_slice);
+    if (wb.empty()) return true;
+    if (ws.empty()) return false;
+
+    int matches = 0;
+    for (const auto& w : wb) {
+        for (const auto& sw : ws) {
+            if (w == sw) {
+                matches++;
+                break;
+            }
+        }
+    }
+    if (wb.size() <= 2) {
+        return matches > 0;
+    }
+    return (double)matches / (double)wb.size() >= 0.40;
+}
+
 } // namespace
 
 TimelineMap build_timeline(const std::string& media_path,
@@ -145,6 +183,149 @@ TimelineMap build_timeline(const std::string& media_path,
     }
 
     return map;
+}
+
+int eliminate_boundary_bleeds(std::vector<srt::Segment>& segments,
+                              TimelineMap& map,
+                              const std::vector<float>& pcm,
+                              transcribe::Session& session,
+                              const transcribe::Options& base_opts,
+                              std::function<void(const std::string&)> on_log) {
+    if (segments.size() < 2 || map.intervals.empty() || pcm.empty()) return 0;
+
+    int pruned_count = 0;
+    double total_sec = (double)pcm.size() / 16000.0;
+
+    transcribe::Options opt = base_opts;
+    opt.vad = false;
+    opt.vad_model_path.clear();
+    opt.vad_regions = nullptr;
+    opt.on_progress = nullptr;
+    opt.on_segment = nullptr;
+    opt.word_timestamps = false;
+
+    for (size_t i = 0; i + 1 < segments.size(); /* conditional increment */) {
+        const auto& A = segments[i];
+        const auto& B = segments[i + 1];
+
+        double gap = B.t0 - A.t1;
+        double dur_b = B.t1 - B.t0;
+
+        // Condition 1: B is bunched onto A (gap <= 0.150s)
+        if (gap > 0.150) {
+            ++i;
+            continue;
+        }
+
+        // Condition 2: B is a short cue (typically <= 2.2s)
+        if (dur_b > 2.20 || dur_b < 0.20) {
+            ++i;
+            continue;
+        }
+
+        // Condition 3: B is followed by a substantial silence gap (>= 3.0s)
+        double sil_dur = 0.0;
+        double sil_start = 0.0;
+        double sil_end = 0.0;
+        for (const auto& iv : map.intervals) {
+            if (iv.type == IntervalType::Silence && iv.t0 >= B.t1 - 0.50 && iv.t0 <= B.t1 + 1.20) {
+                sil_dur = iv.duration();
+                sil_start = iv.t0;
+                sil_end = iv.t1;
+                break;
+            }
+        }
+        if (i + 2 < segments.size()) {
+            double cue_gap = segments[i + 2].t0 - B.t1;
+            if (cue_gap > sil_dur) {
+                sil_dur = cue_gap;
+            }
+        }
+
+        if (sil_dur < 3.0) {
+            ++i;
+            continue;
+        }
+
+        // Suspect candidate detected: acoustically verify whether B is actually spoken in A's interval
+        double t_slice_start = std::max(0.0, A.t0 - 0.20);
+        double t_slice_end   = std::min(total_sec, B.t1 + 0.20);
+        size_t s_start = (size_t)(t_slice_start * 16000.0);
+        size_t s_end   = (size_t)(t_slice_end * 16000.0);
+        if (s_end <= s_start) {
+            ++i;
+            continue;
+        }
+
+        std::vector<float> slice(pcm.begin() + s_start, pcm.begin() + s_end);
+        std::vector<srt::Segment> slice_segs;
+        std::string err;
+        bool b_present = true;
+
+        if (session.transcribe(slice, opt, slice_segs, err)) {
+            std::string slice_text;
+            for (const auto& seg : slice_segs) {
+                if (!slice_text.empty()) slice_text.push_back(' ');
+                slice_text += seg.text;
+            }
+            b_present = is_text_in_slice(B.text, slice_text);
+        }
+        std::vector<float>().swap(slice);
+
+        if (!b_present) {
+            Action act;
+            act.cue_index = (int)(i + 2);
+            act.action_type = "prune_boundary_bleed";
+            act.orig_t0 = B.t0; act.orig_t1 = B.t1;
+            act.new_t0 = 0.0;   act.new_t1 = 0.0;
+            act.text = B.text;
+            std::ostringstream oss;
+            oss << "pruned VAD boundary bleed before " << std::fixed << std::setprecision(1) << sil_dur
+                << "s silence (absent from audio slice)";
+            act.reason = oss.str();
+            map.actions.push_back(act);
+
+            if (on_log) {
+                on_log("Pruned '" + B.text + "' at [" + srt::format_timestamp(B.t0).substr(0, 8) +
+                       "] (absent before " + std::to_string((int)sil_dur) + "s silence)");
+            }
+            logging::logf("INFO", "Pass 2: pruned boundary bleed '%s' [%.2f -> %.2f] (silence: %.1fs)",
+                          B.text.c_str(), B.t0, B.t1, sil_dur);
+
+            // Flag post-silence vocal interval for acoustic re-anchoring
+            for (const auto& iv : map.intervals) {
+                if (iv.type == IntervalType::Vocal && std::abs(iv.t0 - sil_end) < 0.50) {
+                    map.post_bleed_vocal_targets.push_back(iv.t0);
+                    break;
+                }
+            }
+
+            // Prune B
+            segments.erase(segments.begin() + (i + 1));
+            pruned_count++;
+        } else {
+            ++i;
+        }
+    }
+
+    if (pruned_count > 0) {
+        logging::logf("INFO", "Pass 2: pruned %d artificial boundary bleeds", pruned_count);
+    }
+    return pruned_count;
+}
+
+int eliminate_boundary_bleeds(std::vector<srt::Segment>& segments,
+                              TimelineMap& map,
+                              const std::vector<float>& pcm,
+                              const transcribe::Options& base_opts,
+                              std::function<void(const std::string&)> on_log) {
+    transcribe::Session session;
+    std::string err;
+    if (!session.init(base_opts, err)) {
+        logging::error("eliminate_boundary_bleeds: failed to init whisper session: " + err);
+        return 0;
+    }
+    return eliminate_boundary_bleeds(segments, map, pcm, session, base_opts, on_log);
 }
 
 bool sanitize_and_split(std::vector<srt::Segment>& segments,
@@ -334,12 +515,23 @@ void find_missing_vocal_regions(const std::vector<srt::Segment>& segments,
         }
 
         double ratio = covered / dur;
-        if (ratio < min_coverage) {
+
+        // Check if this vocal interval was targeted by a boundary bleed
+        bool is_post_bleed_target = false;
+        for (double t_target : map.post_bleed_vocal_targets) {
+            if (std::abs(iv.t0 - t_target) < 0.50 || (t_target >= iv.t0 && t_target <= iv.t1)) {
+                is_post_bleed_target = true;
+                break;
+            }
+        }
+
+        if (ratio < min_coverage || is_post_bleed_target) {
             MissingRegion mr;
             mr.t0 = iv.t0;
             mr.t1 = iv.t1;
             mr.avg_db = iv.avg_db;
             mr.coverage = ratio;
+            mr.force_reanchor = is_post_bleed_target;
             map.missing_vocal.push_back(mr);
         }
     }
@@ -384,16 +576,46 @@ bool infill_missing_regions(const std::vector<float>& pcm,
                 s.t0 += t_start;
                 s.t1 += t_start;
 
-                // Check for duplicate or heavy overlap with existing cues
-                bool duplicate = false;
-                for (const auto& ex : segments) {
+                // Check for overlapping existing cues
+                srt::Segment* overlapping_cue = nullptr;
+                double max_ov = 0.0;
+                for (auto& ex : segments) {
                     double ov = std::min(s.t1, ex.t1) - std::max(s.t0, ex.t0);
-                    if (ov > 0.40 * (s.t1 - s.t0)) {
-                        duplicate = true;
-                        break;
+                    double s_dur = s.t1 - s.t0;
+                    if (s_dur > 0.0 && ov > 0.35 * s_dur) {
+                        if (ov > max_ov) {
+                            max_ov = ov;
+                            overlapping_cue = &ex;
+                        }
                     }
                 }
-                if (!duplicate) {
+
+                if (overlapping_cue != nullptr) {
+                    bool text_matches = is_text_in_slice(overlapping_cue->text, s.text) ||
+                                        is_text_in_slice(s.text, overlapping_cue->text);
+                    if (!text_matches && mr.force_reanchor) {
+                        Action act;
+                        act.cue_index = (int)(overlapping_cue - segments.data()) + 1;
+                        act.action_type = "reanchor_displaced";
+                        act.orig_t0 = overlapping_cue->t0; act.orig_t1 = overlapping_cue->t1;
+                        act.new_t0 = s.t0;                  act.new_t1 = s.t1;
+                        act.text = s.text;
+                        act.reason = "re-anchored displaced cue (\"" + overlapping_cue->text + "\") with true acoustic dialogue";
+                        map.actions.push_back(act);
+
+                        if (on_log) {
+                            on_log("Re-anchored [" + srt::format_timestamp(s.t0).substr(0, 8) + "]: '" +
+                                   overlapping_cue->text + "' -> '" + s.text + "'");
+                        }
+                        logging::logf("INFO", "Pass 3: re-anchored displaced cue '%s' -> '%s' [%.2f -> %.2f]",
+                                      overlapping_cue->text.c_str(), s.text.c_str(), s.t0, s.t1);
+
+                        overlapping_cue->text = s.text;
+                        overlapping_cue->t0 = s.t0;
+                        overlapping_cue->t1 = s.t1;
+                        recovered_cues++;
+                    }
+                } else {
                     Action act;
                     act.cue_index = (int)segments.size() + 1;
                     act.action_type = "infill_recovered";
@@ -416,7 +638,7 @@ bool infill_missing_regions(const std::vector<float>& pcm,
 
     if (recovered_cues > 0) {
         std::sort(segments.begin(), segments.end(), [](const auto& a, const auto& b) { return a.t0 < b.t0; });
-        logging::logf("INFO", "Pass 3: infilled %d recovered dialogue cues", recovered_cues);
+        logging::logf("INFO", "Pass 3: infilled/re-anchored %d dialogue cues", recovered_cues);
     }
     return true;
 }
@@ -442,6 +664,8 @@ bool write_json(const TimelineMap& map, const std::string& json_path, std::strin
         return false;
     }
 
+    ActionCounts ac = count_actions(map);
+
     std::fprintf(f, "{\n");
     std::fprintf(f, "  \"media\": \"%s\",\n", escape_json(map.media_path).c_str());
     std::fprintf(f, "  \"analysis\": {\n");
@@ -452,7 +676,9 @@ bool write_json(const TimelineMap& map, const std::string& json_path, std::strin
     std::fprintf(f, "    \"vocal_region_count\": %d,\n", map.analysis.vocal_count);
     std::fprintf(f, "    \"silence_region_count\": %d,\n", map.analysis.silence_count);
     std::fprintf(f, "    \"actions_count\": %zu,\n", map.actions.size());
-    std::fprintf(f, "    \"missing_vocal_count\": %zu\n", map.missing_vocal.size());
+    std::fprintf(f, "    \"missing_vocal_count\": %zu,\n", map.missing_vocal.size());
+    std::fprintf(f, "    \"bleeds_pruned_count\": %d,\n", ac.bleeds_pruned);
+    std::fprintf(f, "    \"reanchored_count\": %d\n", ac.reanchored);
     std::fprintf(f, "  },\n");
 
     // Timeline array
@@ -502,7 +728,9 @@ ActionCounts count_actions(const TimelineMap& map) {
         else if (a.action_type == "snap_leading") ac.snapped++;
         else if (a.action_type == "split_pause") ac.split++;
         else if (a.action_type == "drop_hallucination") ac.dropped++;
+        else if (a.action_type == "prune_boundary_bleed") ac.bleeds_pruned++;
         else if (a.action_type == "infill_recovered") ac.infilled++;
+        else if (a.action_type == "reanchor_displaced") ac.reanchored++;
     }
     return ac;
 }

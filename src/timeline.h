@@ -33,7 +33,7 @@ struct Analysis {
 
 struct Action {
     int cue_index = 0;
-    std::string action_type; // "clamp_trailing", "snap_leading", "split_pause", "drop_hallucination", "infill_recovered"
+    std::string action_type; // "clamp_trailing", "snap_leading", "split_pause", "drop_hallucination", "prune_boundary_bleed", "infill_recovered", "reanchor_displaced"
     double orig_t0 = 0.0, orig_t1 = 0.0;
     double new_t0 = 0.0, new_t1 = 0.0;
     std::string text;
@@ -45,6 +45,7 @@ struct MissingRegion {
     double t1 = 0.0;
     float  avg_db = -90.0f;
     double coverage = 0.0; // existing subtitle coverage ratio (0.0 to 1.0)
+    bool   force_reanchor = false; // true if flagged by boundary bleed elimination
     double duration() const { return t1 - t0; }
 };
 
@@ -53,6 +54,7 @@ struct TimelineMap {
     Analysis analysis;
     std::vector<Interval> intervals;
     std::vector<MissingRegion> missing_vocal;
+    std::vector<double> post_bleed_vocal_targets;
     std::vector<Action> actions;
 };
 
@@ -60,6 +62,21 @@ struct TimelineMap {
 TimelineMap build_timeline(const std::string& media_path,
                            const std::vector<float>& pcm,
                            const std::vector<transcribe::VadRegion>& vad_regions);
+
+// Pass 2: Detect and eliminate artificial VAD boundary bleeds (cues bunched before long silences).
+// Acoustically verifies suspect cues against isolated audio slices using an active Whisper session.
+int eliminate_boundary_bleeds(std::vector<srt::Segment>& segments,
+                              TimelineMap& map,
+                              const std::vector<float>& pcm,
+                              transcribe::Session& session,
+                              const transcribe::Options& base_opts,
+                              std::function<void(const std::string&)> on_log = nullptr);
+
+int eliminate_boundary_bleeds(std::vector<srt::Segment>& segments,
+                              TimelineMap& map,
+                              const std::vector<float>& pcm,
+                              const transcribe::Options& base_opts,
+                              std::function<void(const std::string&)> on_log = nullptr);
 
 // Pass 2: Sanitize subtitle cues against the timeline map:
 // - Clamps trailing ends that linger across silence
@@ -71,12 +88,13 @@ bool sanitize_and_split(std::vector<srt::Segment>& segments,
                         double split_pause_threshold = 1.5);
 
 // Pass 2.5: Detect vocal regions that lack subtitle coverage (potential missed dialogue).
+// Also queues post-bleed vocal regions for acoustic re-anchoring.
 void find_missing_vocal_regions(const std::vector<srt::Segment>& segments,
                                 TimelineMap& map,
                                 double min_duration = 0.8,
                                 double min_coverage = 0.20);
 
-// Pass 3: Re-transcribe missed vocal regions using targeted Whisper audio slicing.
+// Pass 3: Re-transcribe missed and un-anchored vocal regions using targeted Whisper audio slicing.
 // Uses an active Whisper session to avoid repeatedly reloading model weights or reinitializing CUDA.
 bool infill_missing_regions(const std::vector<float>& pcm,
                             transcribe::Session& session,
@@ -100,8 +118,10 @@ struct ActionCounts {
     int snapped = 0;
     int split = 0;
     int dropped = 0;
+    int bleeds_pruned = 0;
     int infilled = 0;
-    int total() const { return clamped + snapped + split + dropped + infilled; }
+    int reanchored = 0;
+    int total() const { return clamped + snapped + split + dropped + bleeds_pruned + infilled + reanchored; }
 };
 
 ActionCounts count_actions(const TimelineMap& map);

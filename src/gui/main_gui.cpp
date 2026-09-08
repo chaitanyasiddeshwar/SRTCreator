@@ -304,6 +304,9 @@ static void do_job(Job job) {
         post_str(hwnd, WM_APP_STATUS, 0, L"Pass 2: Sanitizing cues against timeline…");
         auto t_p4_start = std::chrono::steady_clock::now();
         tl_map = timeline::build_timeline(input, pcm, vad_regions);
+        timeline::eliminate_boundary_bleeds(segments, tl_map, pcm, session, t, [hwnd](const std::string& msg) {
+            post_str(hwnd, WM_APP_SEGMENT, 0, L"[bleed] " + to_wide(msg) + L"\r\n");
+        });
         timeline::sanitize_and_split(segments, tl_map, 1.5);
         timeline::find_missing_vocal_regions(segments, tl_map, 0.8, 0.20);
         auto t_p4_end = std::chrono::steady_clock::now();
@@ -363,10 +366,10 @@ static void do_job(Job job) {
                   job.infill ? (tl_map.missing_vocal.empty() ? "N/A (0 missed)" : (format_duration_hms(dur_phase5) + " (" + std::to_string((int)dur_phase5) + "s)").c_str()) : "N/A (disabled)",
                   format_duration_hms(dur_total).c_str(), dur_total);
 
-    logging::logf("INFO", "Post-Processing Summary: Vocal coverage=%.1f%% (%.1fs vocal / %.1fs silence) | Pass 2 fixes=%d (clamped=%d, snapped=%d, split=%d, dropped=%d) | Pass 2.5 missed gaps=%zu | Pass 3 infilled=%d",
+    logging::logf("INFO", "Post-Processing Summary: Vocal coverage=%.1f%% (%.1fs vocal / %.1fs silence) | Pass 2 fixes=%d (clamped=%d, snapped=%d, split=%d, dropped=%d, bleeds=%d) | Pass 2.5 missed gaps=%zu | Pass 3 infilled=%d | Pass 3 re-anchored=%d",
                   tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
-                  ac.total() - ac.infilled, ac.clamped, ac.snapped, ac.split, ac.dropped,
-                  tl_map.missing_vocal.size(), ac.infilled);
+                  ac.total() - ac.infilled - ac.reanchored, ac.clamped, ac.snapped, ac.split, ac.dropped, ac.bleeds_pruned,
+                  tl_map.missing_vocal.size(), ac.infilled, ac.reanchored);
 
     // Append Timing Summary and Post-Processing Summary block to scrolling subtitle area (g_edit)
     std::wstring summary =
@@ -384,13 +387,15 @@ static void do_job(Job job) {
         std::to_wstring((int)(tl_map.analysis.total_vocal_sec + 0.5)) + L"s vocal / " +
         std::to_wstring((int)(tl_map.analysis.total_silence_sec + 0.5)) + L"s silence)\r\n"
         L"  Cues processed:    " + std::to_wstring(orig_cue_count) + L" -> " + std::to_wstring(segments.size()) + L"\r\n"
-        L"  Pass 2 fixes:      " + std::to_wstring(ac.total() - ac.infilled) + L" applied\r\n"
+        L"  Pass 2 fixes:      " + std::to_wstring(ac.total() - ac.infilled - ac.reanchored) + L" applied\r\n"
+        L"    - Pruned bleeds:      " + std::to_wstring(ac.bleeds_pruned) + L"\r\n"
         L"    - Clamped trailing:   " + std::to_wstring(ac.clamped) + L"\r\n"
         L"    - Snapped leading:    " + std::to_wstring(ac.snapped) + L"\r\n"
         L"    - Split pauses:       " + std::to_wstring(ac.split) + L"\r\n"
         L"    - Dropped halluc.:    " + std::to_wstring(ac.dropped) + L"\r\n"
         L"  Missed vocal gaps: " + std::to_wstring(tl_map.missing_vocal.size()) + L" detected\r\n"
         L"  Pass 3 infilled:   " + std::to_wstring(ac.infilled) + L" recovered cues\r\n"
+        L"  Pass 3 re-anchored:" + std::to_wstring(ac.reanchored) + L" displaced cues\r\n"
         L"----------------------------------------\r\n\r\n";
     post_str(hwnd, WM_APP_SEGMENT, 0, summary);
 

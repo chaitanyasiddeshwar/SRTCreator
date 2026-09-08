@@ -305,6 +305,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[srt] Pass 2: Sanitizing cues against timeline...\n");
         auto t_p4_start = std::chrono::steady_clock::now();
         tl_map = timeline::build_timeline(input, pcm, vad_regions);
+        timeline::eliminate_boundary_bleeds(segments, tl_map, pcm, session, topts, [](const std::string& msg) {
+            std::fprintf(stderr, "  [boundary-bleed] %s\n", msg.c_str());
+        });
         timeline::sanitize_and_split(segments, tl_map, pause_split);
         timeline::find_missing_vocal_regions(segments, tl_map, 0.8, 0.20);
         auto t_p4_end = std::chrono::steady_clock::now();
@@ -374,10 +377,10 @@ int main(int argc, char** argv) {
                   infill ? (tl_map.missing_vocal.empty() ? "N/A (0 missed)" : (format_duration_hms(dur_phase5) + " (" + std::to_string((int)dur_phase5) + "s)").c_str()) : "N/A (disabled)",
                   format_duration_hms(dur_total).c_str(), dur_total);
 
-    logging::logf("INFO", "Post-Processing Summary: Vocal coverage=%.1f%% (%.1fs vocal / %.1fs silence) | Pass 2 fixes=%d (clamped=%d, snapped=%d, split=%d, dropped=%d) | Pass 2.5 missed gaps=%zu | Pass 3 infilled=%d",
+    logging::logf("INFO", "Post-Processing Summary: Vocal coverage=%.1f%% (%.1fs vocal / %.1fs silence) | Pass 2 fixes=%d (clamped=%d, snapped=%d, split=%d, dropped=%d, bleeds=%d) | Pass 2.5 missed gaps=%zu | Pass 3 infilled=%d | Pass 3 re-anchored=%d",
                   tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
-                  ac.total() - ac.infilled, ac.clamped, ac.snapped, ac.split, ac.dropped,
-                  tl_map.missing_vocal.size(), ac.infilled);
+                  ac.total() - ac.infilled - ac.reanchored, ac.clamped, ac.snapped, ac.split, ac.dropped, ac.bleeds_pruned,
+                  tl_map.missing_vocal.size(), ac.infilled, ac.reanchored);
 
     std::fprintf(stderr,
                  "\n----------------------------------------\n"
@@ -393,12 +396,14 @@ int main(int argc, char** argv) {
                  "  Vocal coverage:    %.1f%% (%.1fs vocal / %.1fs silence)\n"
                  "  Cues processed:    %zu -> %zu\n"
                  "  Pass 2 fixes:      %d applied\n"
+                 "    - Pruned bleeds:      %d\n"
                  "    - Clamped trailing:   %d\n"
                  "    - Snapped leading:    %d\n"
                  "    - Split pauses:       %d\n"
                  "    - Dropped halluc.:    %d\n"
                  "  Missed vocal gaps: %zu detected\n"
                  "  Pass 3 infilled:   %d recovered cues\n"
+                 "  Pass 3 re-anchored:%d displaced cues\n"
                  "----------------------------------------\n\n",
                  format_duration_hms(dur_phase1).c_str(),
                  format_duration_hms(dur_phase2).c_str(),
@@ -408,8 +413,8 @@ int main(int argc, char** argv) {
                  format_duration_hms(dur_total).c_str(),
                  tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
                  orig_cue_count, segments.size(),
-                 ac.total() - ac.infilled, ac.clamped, ac.snapped, ac.split, ac.dropped,
-                 tl_map.missing_vocal.size(), ac.infilled);
+                 ac.total() - ac.infilled - ac.reanchored, ac.bleeds_pruned, ac.clamped, ac.snapped, ac.split, ac.dropped,
+                 tl_map.missing_vocal.size(), ac.infilled, ac.reanchored);
 
     // 6) Optional timing diagnostics (--debug): correlate VAD regions, whisper
     // cues, actual audio energy, and an optional reference SRT.

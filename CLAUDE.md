@@ -48,9 +48,9 @@ input file
   -> [Phase 2]    MDX-Net vocal isolation via DirectML (Kim_Vocal_2) -> free mix buffer
   -> libswresample resample -> 16 kHz mono f32 PCM -> free 44.1k vocals buffer
   -> [Phase 3 / Pass 1] whisper.cpp (CUDA Session, Silero VAD, flash-attn, DTW word timing) -> raw cues + timeline
-  -> [Phase 4 / Pass 2] silence sanitization: trailing silence clamp, leading snap, pause split (>= 1.5s), hallucination prune -> export <input>.timeline.json
-  -> [Pass 2.5]   detect missing vocal regions (duration >= 0.8s, coverage < 20%)
-  -> [Phase 5 / Pass 3] targeted audio infill using active CUDA Session -> chronologically splice dialogue
+  -> [Phase 4 / Pass 2] silence sanitization: trailing silence clamp, leading snap, pause split (>= 1.5s), hallucination prune, boundary bleed detection & slice verification -> export <input>.timeline.json
+  -> [Pass 2.5]   detect missing vocal regions (duration >= 0.8s, coverage < 20% + un-anchored post-bleed gaps)
+  -> [Phase 5 / Pass 3] targeted audio infill & re-anchoring using active CUDA Session -> chronologically splice dialogue
   -> Resource cleanup: free PCM buffer, close Session, cudaDeviceReset(), compact working set
   -> SRT writer   wrap (42 cols) + windowed de-dup -> <input>.srt
 ```
@@ -112,6 +112,16 @@ The big speed levers, in order of impact for typical movie files:
 
 Rule of thumb target: on a 3080 Ti, `large-v3-turbo` (q8_0) + FA + VAD should
 transcribe a 2-hour movie well under realtime.
+
+### 3.1 The VAD Concatenation Seam Artifact & Multi-Pass Resolution
+
+While Silero VAD cuts transcription time by skipping minutes of soundtrack score/silence, naive VAD audio concatenation introduces a subtle timing pathology in Whisper:
+1. **The Flaw**: `whisper.cpp` excises silence intervals and concatenates speech segments with minimal padding (~200ms). When two utterances $A$ and $B$ are separated by a long silence gap (e.g., 5–30s+), they sit adjacent inside Whisper's 30s mel window.
+2. **The Non-Linear Time Mapping Jump**: `whisper.cpp` maps token timestamps back to original audio time via a piecewise linear table. Autoregressive attention across the 200ms seam can cause the initial word of utterance $B$ ("Guys!") to receive a timestamp milliseconds before the seam. The table projects this timestamp across the entire multi-second silence gap back into $A$'s time domain, bunching $B$ onto the tail of $A$ ("Let's keep looking.").
+3. **Downstream Cascading**: When real film time reaches $B$'s acoustic event 20s later, Whisper's decoder has already consumed $B$, so it outputs the next utterance $C$ ("It's Alpha Trion!") into $B$'s time slot.
+4. **Resolution in Pass 2 & Pass 3**:
+   - **Pass 2 Acoustic Slice Verification**: Suspect bunched cues $(A, B)$ where $\text{gap}(A, B) \le 0.15\text{s}$, $\text{dur}(B) \le 1.8\text{s}$, and $B$ precedes a silence gap $\ge 3.0\text{s}$ are checked against $A$'s true audio slice using the resident GPU session (`Session::run_slice`). If $B$'s text is missing from $A$'s acoustic audio, $B$ is pruned as an artificial bleed and $A$'s tail is clamped.
+   - **Pass 2.5 / Pass 3 Re-Anchoring**: The vocal interval following the silence gap is flagged for targeted infill. Transcribed in isolation without stitched VAD audio, Whisper cleanly outputs $B$ ("Guys!") at its true acoustic timestamp (e.g. `00:42:18`).
 
 ---
 

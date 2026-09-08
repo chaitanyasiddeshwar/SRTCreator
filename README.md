@@ -29,8 +29,8 @@ On an RTX 3080 Ti it transcribes roughly **70× faster than real time**
   and Silero VAD prevents repetition loops and cuts non-speech hallucinations.
 - **3-Pass Timing & Quality Pipeline**:
   - **Pass 1: Speech Transcription** — Whisper ASR with acoustic onset/offset tightening and DTW word-level timing.
-  - **Pass 2: Silence Sanitization & Timeline Mapping** — Generates a timeline JSON partitioning the audio into alternating `silence` and `vocal` intervals; clamps trailing ends over silence, snaps leading starts to true speech onset, splits cues across mid-sentence pauses (≥ 1.5s), and prunes pure silence hallucinations.
-  - **Pass 3: Targeted Audio Infill** — Automatically detects vocal intervals lacking subtitle coverage and re-transcribes them using high-speed, single-session GPU inference to recover missed dialogue.
+  - **Pass 2: Silence Sanitization & Timeline Mapping** — Generates a timeline JSON partitioning the audio into alternating `silence` and `vocal` intervals; clamps trailing ends over silence, snaps leading starts to true speech onset, splits cues across mid-sentence pauses (≥ 1.5s), eliminates artificial boundary bleeds where VAD stitches cues across silence, and prunes pure silence hallucinations.
+  - **Pass 3: Targeted Audio Infill & Re-Anchoring** — Automatically detects vocal intervals lacking subtitle coverage (and intervals un-anchored by boundary bleeds) and re-transcribes them using high-speed, single-session GPU inference to recover missed dialogue at its true acoustic timestamp.
 - **Per-Phase Timing & Summaries** — Detailed runtime logs in `hh:mm:ss` for all 5 phases (Audio extraction, Voice isolation, Transcription, Silence sanitization, Targeted infill) and comprehensive post-processing statistics.
 - **Automatic language detection & Translation** (`--translate`).
 - **Readable line wrapping** (Netflix-style 42 chars/line by default).

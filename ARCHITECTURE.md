@@ -92,15 +92,16 @@ The pipeline executes in 5 sequential phases with strict resource lifetimes and 
         ├─▶ Leading silence snapping (snap cue starts forward to speech onsets)
         ├─▶ In-sentence pause splitting (split cues spanning silence gaps >= 1.5s)
         ├─▶ Hallucination pruning (drop cues falling 100% inside silence)
+        ├─▶ Boundary bleed elimination (detect bunched cues before silence; verify via slice)
         ▼
-   [Phase 4.5: Non-Silence Gap Analysis]
+   [Phase 4.5: Non-Silence Gap Analysis & Post-Bleed Re-Anchoring]
         ▼
-   Detect uncaptioned speech (vocal intervals >= 0.8s with < 20% subtitle coverage)
+   Detect uncaptioned speech (vocal intervals >= 0.8s with < 20% coverage + post-bleed gaps)
         │  Yields missing_vocal_regions list
         │
         ▼
-   [Phase 5: Pass 3 Targeted Audio Infill] (timeline.cpp + transcribe::Session)
-        │  Targeted re-transcription over missing vocal audio slices
+   [Phase 5: Pass 3 Targeted Audio Infill & Re-Anchoring] (timeline.cpp + transcribe::Session)
+        │  Targeted re-transcription over missing/un-anchored vocal audio slices
         │  *Reuses active GPU Session (zero model reload / ~25ms per slice)*
         │  *Audio slices freed immediately per chunk*
         ▼
@@ -371,19 +372,28 @@ To ensure **no subtitles linger on screen during silence** and **no spoken dialo
 ### 10.1 Pass 1: Primary Transcription & Timeline Generation
 Whisper ASR executes on the full 16 kHz audio buffer using Silero VAD and DTW token timestamps (`word_timestamps = true`). In parallel, acoustic RMS energy and Silero VAD segments are combined to generate an exact partition of alternating `vocal` and `silence` intervals across the entire duration.
 
-### 10.2 Pass 2: Silence Sanitization & In-Sentence Pause Splitting
+### 10.2 Pass 2: Silence Sanitization, Boundary Bleed Detection & In-Sentence Pause Splitting
 Subtitles are validated and aligned against the timeline partition:
 - **Trailing Silence Clamping**: Prevents subtitles from lingering over silence when characters stop talking. The cue end is clamped to the vocal boundary plus an adaptive reading buffer ($\le 1.4\text{s}$).
 - **Leading Silence Snapping**: Snaps back-dated cue starts forward to the true acoustic onset of speech.
 - **In-Sentence Pause Splitting**: If an actor pauses for $\ge 1.5\text{s}$ mid-sentence, the single subtitle cue is cleanly split at the silence boundary across sentence punctuation/words. The screen remains completely clear during the pause.
 - **Hallucination Pruning**: Cues that fall entirely inside silence intervals (e.g. repetition loops or instrumental score hallucinations) are removed.
-- **Timeline Export**: The complete set of intervals and sanitization actions is exported to `<input>.timeline.json`.
+- **Boundary Bleed & Subtitle Packing Elimination**:
+  - *The VAD Concatenation Flaw*: `whisper.cpp`'s VAD mode excises long silence gaps and stitches detected speech segments together with minimal boundary padding (~200ms). When two real speech events $A$ and $B$ are separated by a long silence gap (e.g. 5s to 30s+), they are brought into direct juxtaposition in the concatenated audio buffer.
+  - *The Non-Linear Time Mapping Jump*: `whisper.cpp` converts timestamps from the concatenated domain back to original audio time via a piecewise linear mapping table. Because Whisper's transformer decoder operates on 30-second mel windows spanning multiple stitched segments, autoregressive attention can assign the first token of utterance $B$ ("Guys!") a timestamp mere milliseconds prior to the 200ms boundary seam. The mapping table projects this across the entire multi-second silence gap back into $A$'s time domain, packing $B$ directly onto $A$ ("Let's keep looking.").
+  - *Cascading Utterance Displacement*: When the movie reaches $B$'s true speech event 20–30s later, Whisper's decoder has already emitted $B$ in its autoregressive context. It consequently decodes the *subsequent* speech event $C$ ("It's Alpha Trion!") into $B$'s time slot, cascading forward until an extended natural silence resynchronizes the attention window.
+  - *Detection Signature*: Consecutive cues $(A, B)$ where $\text{gap}(A, B) \le 0.150\text{s}$, duration of $B \le 1.8\text{s}$ (short interjection/call-out), and $B$ is followed by a substantial silence gap $\ge 3.0\text{s}$.
+  - *Acoustic Slice Verification via `Session::run_slice`*: Pass 2 extracts an isolated audio slice spanning $A$'s interval (`[A.t0 - 0.1s, B.t1 + 0.1s]`) and executes fast GPU verification (~25ms) using the resident Whisper session without VAD audio concatenation. If $B$'s words are absent from $A$'s true acoustic slice, $B$ is confirmed as an artificial VAD boundary bleed.
+  - *Pruning*: Cue $B$ is pruned from $A$'s interval (`action_type = "prune_boundary_bleed"`), $A$'s trailing end is cleanly clamped to its vocal boundary, and the post-silence interval is flagged for re-anchoring.
+- **Timeline Export**: The complete set of intervals, missing vocal regions, and sanitization actions is exported to `<input>.timeline.json`.
 
-### 10.3 Pass 2.5: Non-Silence Gap Analysis
-Every vocal interval is checked against subtitle coverage. Any vocal interval $\ge 0.8\text{s}$ with $< 20\%$ subtitle coverage is identified as an uncaptioned dialogue candidate and queued for infill.
+### 10.3 Pass 2.5: Non-Silence Gap Analysis & Post-Bleed Re-Anchoring
+Every vocal interval is checked against subtitle coverage:
+- **Uncaptioned Speech Detection**: Any vocal interval $\ge 0.8\text{s}$ with $< 20\%$ subtitle coverage is identified as an uncaptioned dialogue candidate.
+- **Shadowed Region Recovery**: Previously, if a displaced downstream cue $C$ fell inside $B$'s vocal interval, Pass 2.5 computed coverage as $> 20\%$ and missed the gap. When a boundary bleed $B$ is pruned in Pass 2, the vocal interval directly following the silence gap is flagged as a high-priority infill candidate regardless of existing displaced cue coverage.
 
-### 10.4 Pass 3: Targeted Audio Infill
-The active `transcribe::Session` executes fast, targeted GPU inference over each missing vocal slice (padded by 0.35s). Recovered dialogue cues are re-aligned to global timestamps and chronologically spliced into the subtitle stream.
+### 10.4 Pass 3: Targeted Audio Infill & Acoustic Re-Anchoring
+The active `transcribe::Session` executes fast, targeted GPU inference over each missing/un-anchored vocal slice (padded by 0.35s). Because each slice is transcribed in isolation without VAD audio concatenation, Whisper accurately transcribes $B$ ("Guys!") at its true acoustic timestamp (e.g. `00:42:18`). Recovered cues are re-aligned to global timestamps and chronologically spliced into the subtitle stream.
 
 ---
 
