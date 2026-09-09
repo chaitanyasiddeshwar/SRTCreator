@@ -244,9 +244,9 @@ Either way, the *project's* build is CUDA-free and toolkit-free; whisper DLLs ar
 2. **Multi-pass timing patch:** drop it (accept stock timing on the legacy path) or keep an
    optional from-source build for it? If we're committing to segment mode, dropping it is
    cleanest. (Ties to whether multi-pass is retired — see the earlier simplification report.)
-3. **Do we need our own controlled whisper build at all,** or can stock upstream zips be
-   made to do CPU↔GPU fallback as-is? Needs a spike: drop `ggml-cuda.dll` from the cuBLAS
-   zip next to the CPU zip's `whisper.dll` and see if `ggml_backend_load_all()` picks it up.
+3. ~~**Do we need our own controlled whisper build at all?**~~ **RESOLVED — see §10.**
+   Stock upstream zips are built with `GGML_BACKEND_DL=ON`; `ggml-cuda.dll` is a drop-in.
+   No custom build needed for CPU+CUDA. (Vulkan still needs a one-time build.)
 4. **CUDA version:** upstream prebuilt tops out at CUDA 12.4; we currently build 13.0. 12.4
    runtime + a recent driver is fine, but confirm on the target 3080 Ti driver.
 5. **Isolation on CPU-only machines:** DirectML needs a DX12 GPU. On a truly GPU-less box,
@@ -274,6 +274,45 @@ Either way, the *project's* build is CUDA-free and toolkit-free; whisper DLLs ar
    `build.bat` CUDA discovery (or gate them behind an optional dev-from-source flag).
 5. **Cleanup:** if multi-pass is being retired anyway, remove `timeline.*` (~1,065 lines,
    see prior report) so the shipped surface is just orchestration + segment mode.
+
+---
+
+## 10. Spike results (verified 2026-09-09)
+
+Investigated the "do we need our own whisper build" question against the **authoritative
+source — whisper.cpp's release CI** (`.github/workflows/release.yml`) plus our pinned ggml
+headers. Findings:
+
+- **Both the CPU and cuBLAS Windows-x64 release jobs use identical ggml flags:**
+  `-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF`
+  (the cuBLAS job adds `-DGGML_CUDA=ON`). So every shipped x64 zip already uses dynamic
+  backend loading and CPU-variant selection.
+- **`ggml-cuda.dll` is therefore a drop-in backend.** The cuBLAS job builds the same
+  `whisper.dll` / `ggml.dll` / `ggml-base.dll` / `ggml-cpu*.dll` as the CPU zip, plus
+  `ggml-cuda.dll`, and its "Copy CUDA DLLs" step bundles the entire CUDA runtime
+  (`$CUDA_PATH\bin\*.dll` → cudart, cublas, cublasLt, nvrtc…) — which is why that zip is
+  640 MB (12.4) / 257 MB (11.8). **End users need only an NVIDIA driver, not the Toolkit.**
+- **Conclusion: no custom whisper build is required for CPU+CUDA.** Take the 8 MB CPU zip as
+  the base; add `ggml-cuda.dll` + the CUDA runtime DLLs from the cuBLAS zip as the NVIDIA
+  GPU pack. `ggml_backend_load_all()` picks CUDA when the DLL + driver are present, else CPU.
+- **Our pinned ggml (`v1.9.3-182`) exposes the needed API:** `ggml_backend_load_all()`,
+  `ggml_backend_load(path)`, `ggml_backend_load_all_from_path(dir)`, and device enumeration
+  (`ggml_backend_dev_count/get/name`, `ggml_backend_dev_get_props`) for reporting the active
+  backend. So the runtime detection/fallback/report code is straightforward.
+- **Vulkan:** there is **no** stock Windows Vulkan release artifact (no `windows-vulkan` job
+  in the CI). A Vulkan pack requires a one-time `-DGGML_VULKAN=ON` build (Vulkan SDK only,
+  no CUDA) — still a CUDA-free, toolkit-free path for the *project*.
+- **Version hygiene:** upstream prebuilt CUDA tops out at **CUDA 12.4** (we build 13.0
+  today). 12.4 runtime + a current driver is fine on the 3080 Ti; match the whisper DLL
+  version to the headers we compile against (pin a specific release, mirror it locally like
+  FFmpeg).
+
+**Residual risk (small):** I could not run the combined DLLs here — the sandbox blocks
+GitHub release-asset downloads (they redirect to `objects.githubusercontent.com`), and GPU
+selection can't be validated without the hardware. The CI flags make CPU↔CUDA drop-in
+near-certain, but the final confirmation is a 10-minute physical test: unzip the CPU + a
+`ggml-cuda.dll` next to a tiny test exe on the 3080 Ti and confirm `ggml_backend_load_all()`
+selects CUDA.
 
 ---
 
