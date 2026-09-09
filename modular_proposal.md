@@ -1,6 +1,6 @@
 # Modular / Productisation Refactor Proposal
 
-**Status:** exploration + plan for discussion (branch `module_refactor`). Nothing here is implemented yet.
+**Status:** exploration + plan (branch `module_refactor`). **Decisions locked 2026-09-09 — see §11.** Not yet implemented.
 
 **Goal (as stated):** stop *building* the heavy third-party dependencies as part of our
 build. Consume them as **prebuilt runtime DLLs**, leaving the main executables (`srt.exe`
@@ -257,7 +257,40 @@ Either way, the *project's* build is CUDA-free and toolkit-free; whisper DLLs ar
 
 ---
 
-## 8. Phased plan
+## 11. Decisions (locked 2026-09-09)
+
+- **GPU strategy: Option B — Vulkan + CPU. Drop CUDA entirely.** One small universal GPU
+  pack (`ggml-vulkan.dll`, driver-only, any modern GPU) over a CPU base. Accept the ~10%
+  speed cost vs CUDA for a few-MB, vendor-neutral GPU story and no ~500 MB CUDA pack.
+- **Remove the multi-pass pipeline AND drop `patches/whisper.patch`.** Go prebuilt-only;
+  delete `timeline.{h,cpp}` (~1,065 lines) and the legacy Pass 2/3 code paths, flags, and UI.
+  Segment mode is the sole pipeline; it needs neither the patch nor whisper's internal VAD.
+
+### Blockers for the dependency swap (must be resolved on the dev machine)
+- **Vulkan SDK not installed** (`VULKAN_SDK` unset, no `glslc`). Required to build
+  `ggml-vulkan.dll` via `-DGGML_VULKAN=ON`. → install the LunarG Vulkan SDK.
+- **Prebuilt whisper DLLs must be fetched** (`whisper-bin-x64.zip`, CPU base). The agent
+  session cannot download GitHub release assets (CDN blocked); the user fetches the zip, or
+  we mirror it into `third_party/whisper/` like FFmpeg. Pin a release whose headers match
+  the DLLs.
+
+### Revised execution order
+1. **Phase 1 — Remove multi-pass (buildable now, no new deps).** Delete `timeline.{h,cpp}`;
+   strip the Pass 2/3 blocks, `--multipass`/`--legacy`/`--no-infill`/`--pause-split`/
+   `--timeline-json` flags, the GUI "Multi-pass mode" checkbox, and the timeline-summary
+   code from `main.cpp`/`main_gui.cpp`. Segment mode becomes the only path. Still builds
+   whisper from source for now.
+2. **Phase 2 — Dependency swap (needs Vulkan SDK + prebuilt whisper).** Replace
+   `add_subdirectory(third_party/whisper.cpp)` + all `GGML_*`/CUDA settings with a
+   `third_party/whisper/{include,lib,bin}` block (import lib + headers + CPU DLLs); build
+   `ggml-vulkan.dll` once; wire `ggml_backend_load_all()` + device reporting in
+   `transcribe.cpp`; remove the submodule + patch + `build.bat` CUDA discovery.
+3. **Phase 3 — Productise.** First-run backend/driver detection, optional Vulkan-pack +
+   model downloader, tiered zips, README/ARCHITECTURE rewrite.
+
+---
+
+## 8. Phased plan (original, superseded by §11 for the chosen path)
 
 1. **Spike (½–1 day):** drop stock `whisper-bin-x64` (CPU) + `whisper-cublas-12.4.0`
    `ggml-cuda.dll` side by side; test whether `ggml_backend_load_all()` gives CPU↔CUDA
