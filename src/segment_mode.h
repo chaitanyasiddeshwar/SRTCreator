@@ -1,9 +1,9 @@
-// segment_mode.{h,cpp} - EXPERIMENTAL alternate transcription pipeline.
+// segment_mode.{h,cpp} - the transcription pipeline.
 //
 // Instead of handing the whole audio to whisper with its internal Silero VAD
 // (which excises silence and *concatenates* speech into 30s mel windows, causing
-// the seam / bunching / cascade timing pathology described in CLAUDE.md 3.1 and
-// forcing the Pass 2/2.5/3 cleanup), this pipeline:
+// the seam / bunching / cascade timing pathology described in CLAUDE.md 3.1), this
+// pipeline:
 //   1. runs Silero VAD standalone over the full 16k mono PCM to partition it into
 //      speech regions (original timeline), and
 //   2. transcribes each region in isolation via the already-loaded Whisper
@@ -11,10 +11,8 @@
 //      region start.
 // No concatenation => no seam => cue timing is just region_start + local time.
 //
-// This is intentionally self-contained and shallow: it reuses transcribe::Session
-// and produces a plain segment vector for srt::write. It is gated by --segment-mode
-// and leaves the default pipeline untouched, so it can be discarded by deleting
-// this file and the single branch in main.cpp.
+// It is intentionally self-contained and shallow: it reuses transcribe::Session
+// and produces a plain segment vector for srt::write.
 #pragma once
 
 #include <functional>

@@ -1,3 +1,4 @@
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -15,7 +16,6 @@
 #include "separate.h"
 #include "log.h"
 #include "debug.h"
-#include "timeline.h"
 #include "segment_mode.h"
 
 namespace {
@@ -52,11 +52,8 @@ void usage() {
         "                           isolation (default OFF: isolate from full stereo downmix)\n"
         "      --vocal-model <name> Vocal model: Kim_Vocal_2 (default), etc.\n"
         "      --no-cache           Ignore any cached <stem>.vocals16k/.whisper16k.wav\n"
-        "      --multipass          Use the legacy multi-pass timeline pipeline instead of\n"
-        "                           the default per-region segment mode (--legacy alias).\n"
-        "      --no-infill          Multi-pass only: disable Pass 3 infill for missed speech\n"
-        "      --pause-split <sec>  Split cues across pauses >= <sec> (default: 1.5, 0=off)\n"
-        "      --timeline-json <path> Path to output timeline JSON (default: <output>.timeline.json)\n"
+        "      --backend <name>     Compute backend: auto (default), cuda, vulkan, cpu.\n"
+        "                           Only backends detected on this machine are usable.\n"
         "      --no-word-timestamps Disable DTW word timing (on by default; it\n"
         "                           snaps each cue to the actual spoken words)\n"
         "      --dump-audio [path]  Write the 16k mono audio whisper hears to a WAV\n"
@@ -111,13 +108,8 @@ int main(int argc, char** argv) {
     std::string offset_s;               // constant sync shift (seconds; +later, -earlier)
     bool debug = false;                 // write a timing diagnostic report
     std::string reference_path;         // optional reference SRT for the debug report
-    bool infill = true;                 // Pass 3 targeted infill for missed speech
-    double pause_split = 1.5;           // Pass 2 pause splitting threshold in seconds
-    std::string pause_split_s;
-    std::string timeline_json;
     bool use_cache = true;              // reuse an existing <stem>.vocals16k/.whisper16k.wav
-    bool segment_mode_on = true;        // DEFAULT: VAD-segment then per-region transcribe.
-                                        // --multipass selects the legacy timeline pipeline.
+    std::string backend_name;           // --backend auto|cuda|vulkan|cpu (empty = auto)
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -136,13 +128,8 @@ int main(int argc, char** argv) {
         else if (a == "--center")          center = true;
         else if (a == "--isolate-vocals" || a == "--vocals") { /* Vocal isolation is always enabled */ }
         else if (a == "--vocal-model")     { if (!take(argc, argv, i, "--vocal-model", vocal_model)) return 2; }
-        else if (a == "--no-infill")       infill = false;
-        else if (a == "--infill")          infill = true;
         else if (a == "--no-cache")        use_cache = false;
-        else if (a == "--segment-mode")    segment_mode_on = true;  // default; kept for compatibility
-        else if (a == "--multipass" || a == "--legacy") segment_mode_on = false;
-        else if (a == "--pause-split" || a == "--pause-split-threshold") { if (!take(argc, argv, i, a.c_str(), pause_split_s)) return 2; }
-        else if (a == "--timeline-json")   { if (!take(argc, argv, i, "--timeline-json", timeline_json)) return 2; }
+        else if (a == "--backend")         { if (!take(argc, argv, i, "--backend", backend_name)) return 2; }
         else if (a == "--word-timestamps") word_ts = true;
         else if (a == "--no-word-timestamps") word_ts = false;
         else if (a == "--dump-audio")      { dump_audio = true; if (i + 1 < argc && argv[i+1][0] != '-') dump_audio_path = argv[++i]; }
@@ -193,17 +180,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    logging::logf("INFO", "input=%s model=%s lang=%s translate=%d center=%d infill=%d wrap=%d",
+    logging::logf("INFO", "input=%s model=%s lang=%s translate=%d center=%d wrap=%d",
                   input.c_str(), model_path.c_str(), language.c_str(),
-                  (int)translate, (int)center, (int)infill, max_line_length);
+                  (int)translate, (int)center, max_line_length);
 
     // 3) Decode audio (44.1k stereo) and isolate vocals -> 16 kHz mono f32.
     auto t_job_start = std::chrono::steady_clock::now();
     double dur_phase1 = 0.0; // Audio extraction
     double dur_phase2 = 0.0; // Voice isolation
-    double dur_phase3 = 0.0; // Speech transcription (Pass 1)
-    double dur_phase4 = 0.0; // Silence sanitization (Pass 2)
-    double dur_phase5 = 0.0; // Targeted audio infill (Pass 3)
+    double dur_phase3 = 0.0; // Speech transcription
 
     double maxsec = duration_s.empty() ? 0.0 : std::atof(duration_s.c_str());
     std::vector<float> pcm;
@@ -316,6 +301,31 @@ int main(int argc, char** argv) {
     std::vector<transcribe::VadRegion> vad_regions;
     topts.vad_regions     = &vad_regions;
 
+    // Resolve --backend <name> to a device index (empty = auto). Names are matched
+    // against the backends actually detected on this machine.
+    if (!backend_name.empty() && backend_name != "auto") {
+        auto devs = transcribe::available_devices();
+        std::string want = backend_name;
+        for (auto& c : want) c = (char)std::tolower((unsigned char)c);
+        int found = -1;
+        for (size_t di = 0; di < devs.size(); ++di) {
+            std::string nm = devs[di].name;
+            for (auto& c : nm) c = (char)std::tolower((unsigned char)c);
+            bool is_cpu = !devs[di].is_gpu;
+            if ((want == "cpu" && is_cpu) ||
+                (want == "cuda" && nm.rfind("cuda", 0) == 0) ||
+                (want == "vulkan" && nm.rfind("vulkan", 0) == 0)) { found = (int)di; break; }
+        }
+        if (found < 0) {
+            std::string avail;
+            for (auto& d : devs) { if (!avail.empty()) avail += ", "; avail += d.name; }
+            std::fprintf(stderr, "error: backend '%s' not available on this machine. Detected: %s\n",
+                         backend_name.c_str(), avail.c_str());
+            return 2;
+        }
+        topts.device_index = found;
+    }
+
     logging::info("transcribing");
     std::vector<srt::Segment> segments;
     transcribe::Session session;
@@ -325,24 +335,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
-    if (segment_mode_on) {
-        // DEFAULT pipeline: VAD partitions the track into speech regions and each is
-        // transcribed in isolation (no whisper-VAD concatenation, no seam). Leaves
-        // vad_regions empty so the legacy Pass 2/3 block below is skipped entirely.
-        // Pass --multipass/--legacy to use the timeline pipeline instead. See
-        // segment_mode.{h,cpp}.
-        std::fprintf(stderr, "[srt] segment mode: VAD-segmented per-region transcription\n");
-        segment_mode::Options sopts;
-        sopts.vad_model_path = vad_path;
-        if (!segment_mode::run(pcm, session, topts, sopts, segments, err,
-                [](const std::string& m){ std::fprintf(stderr, "  [segment] %s\n", m.c_str()); })) {
-            logging::error("segment-mode failed: " + err);
-            session.close();
-            std::fprintf(stderr, "error: %s\n", err.c_str());
-            return 1;
-        }
-    } else if (!session.transcribe(pcm, topts, segments, err)) {
-        logging::error("transcribe failed: " + err);
+    // Pipeline: standalone Silero VAD partitions the track into speech regions and
+    // each is transcribed in isolation (no whisper-VAD concatenation, no seam), so
+    // cue timing is just region_start + local time. See segment_mode.{h,cpp}.
+    std::fprintf(stderr, "[srt] segment mode: VAD-segmented per-region transcription\n");
+    segment_mode::Options sopts;
+    sopts.vad_model_path = vad_path;
+    if (!segment_mode::run(pcm, session, topts, sopts, segments, err,
+            [](const std::string& m){ std::fprintf(stderr, "  [segment] %s\n", m.c_str()); })) {
+        logging::error("segment-mode failed: " + err);
         session.close();
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
@@ -352,63 +353,7 @@ int main(int argc, char** argv) {
     logging::logf("INFO", "Phase 3 (Transcription) completed in %s (%.2fs)",
                   format_duration_hms(dur_phase3).c_str(), dur_phase3);
     std::fprintf(stderr, "[timing] Phase 3 (Transcription): %s\n", format_duration_hms(dur_phase3).c_str());
-    logging::logf("INFO", "transcribed %zu raw segments", segments.size());
-
-    // Pass 2: Sanitize cues & split mid-sentence pauses against timeline
-    size_t orig_cue_count = segments.size();
-    size_t dot_pos = output.find_last_of('.');
-    std::string json_path = timeline_json.empty()
-        ? ((dot_pos == std::string::npos ? output : output.substr(0, dot_pos)) + ".timeline.json")
-        : timeline_json;
-
-    timeline::TimelineMap tl_map;
-    if (!segment_mode_on && !vad_regions.empty()) {
-        std::fprintf(stderr, "[srt] Pass 2: Sanitizing cues against timeline...\n");
-        auto t_p4_start = std::chrono::steady_clock::now();
-        tl_map = timeline::build_timeline(input, pcm, vad_regions);
-        // Pre-step: remove whole-film repetition-loop hallucinations so their vocal
-        // regions read as uncovered and get re-transcribed cleanly by Pass 3.
-        timeline::suppress_repetition_loops(segments, tl_map, 8, 3, [](const std::string& msg) {
-            std::fprintf(stderr, "  [loop-suppress] %s\n", msg.c_str());
-        });
-        timeline::eliminate_boundary_bleeds(segments, tl_map, pcm, session, topts, [](const std::string& msg) {
-            std::fprintf(stderr, "  [boundary-bleed] %s\n", msg.c_str());
-        });
-        timeline::sanitize_and_split(segments, tl_map, pause_split);
-        timeline::find_missing_vocal_regions(segments, tl_map, 0.8, 0.20);
-        auto t_p4_end = std::chrono::steady_clock::now();
-        dur_phase4 = std::chrono::duration<double>(t_p4_end - t_p4_start).count();
-        logging::logf("INFO", "Phase 4 (Silence sanitization) completed in %s (%.2fs)",
-                      format_duration_hms(dur_phase4).c_str(), dur_phase4);
-        std::fprintf(stderr, "[timing] Phase 4 (Silence sanitization): %s\n", format_duration_hms(dur_phase4).c_str());
-
-        auto ac_p2 = timeline::count_actions(tl_map);
-        logging::logf("INFO", "Pass 2 sanitation: %d actions applied (cues: %zu -> %zu)",
-                      ac_p2.total(), orig_cue_count, segments.size());
-        std::fprintf(stderr, "[srt] Pass 2 applied %d timing fixes (cues: %zu -> %zu)\n",
-                     ac_p2.total(), orig_cue_count, segments.size());
-
-        if (infill && !tl_map.missing_vocal.empty()) {
-            std::fprintf(stderr, "[srt] Pass 3: Infilling %zu missed speech regions...\n", tl_map.missing_vocal.size());
-            auto t_p5_start = std::chrono::steady_clock::now();
-            timeline::infill_missing_regions(pcm, session, topts, tl_map, segments, [](const std::string& msg) {
-                std::fprintf(stderr, "  [infill] %s\n", msg.c_str());
-            });
-            auto t_p5_end = std::chrono::steady_clock::now();
-            dur_phase5 = std::chrono::duration<double>(t_p5_end - t_p5_start).count();
-            logging::logf("INFO", "Phase 5 (Targeted audio infill) completed in %s (%.2fs)",
-                          format_duration_hms(dur_phase5).c_str(), dur_phase5);
-            std::fprintf(stderr, "[timing] Phase 5 (Targeted audio infill): %s\n", format_duration_hms(dur_phase5).c_str());
-        }
-
-        std::string jerr;
-        if (timeline::write_json(tl_map, json_path, jerr)) {
-            logging::info("wrote timeline json: " + json_path);
-            std::fprintf(stderr, "[srt] wrote timeline analysis: %s\n", json_path.c_str());
-        } else {
-            logging::error("failed to write timeline json: " + jerr);
-        }
-    }
+    logging::logf("INFO", "transcribed %zu segments", segments.size());
 
     session.close(); // explicitly release Whisper model and reset CUDA device memory
 
@@ -433,20 +378,12 @@ int main(int argc, char** argv) {
 
     auto t_job_end = std::chrono::steady_clock::now();
     double dur_total = std::chrono::duration<double>(t_job_end - t_job_start).count();
-    auto ac = timeline::count_actions(tl_map);
 
-    logging::logf("INFO", "Timing Summary: 1.Audio extraction=%s (%.2fs) | 2.Voice isolation=%s (%.2fs) | 3.Transcription=%s (%.2fs) | 4.Silence sanitize=%s (%.2fs) | 5.Targeted infill=%s | Total=%s (%.2fs)",
+    logging::logf("INFO", "Timing Summary: 1.Audio extraction=%s (%.2fs) | 2.Voice isolation=%s (%.2fs) | 3.Transcription=%s (%.2fs) | Total=%s (%.2fs)",
                   format_duration_hms(dur_phase1).c_str(), dur_phase1,
                   format_duration_hms(dur_phase2).c_str(), dur_phase2,
                   format_duration_hms(dur_phase3).c_str(), dur_phase3,
-                  format_duration_hms(dur_phase4).c_str(), dur_phase4,
-                  infill ? (tl_map.missing_vocal.empty() ? "N/A (0 missed)" : (format_duration_hms(dur_phase5) + " (" + std::to_string((int)dur_phase5) + "s)").c_str()) : "N/A (disabled)",
                   format_duration_hms(dur_total).c_str(), dur_total);
-
-    logging::logf("INFO", "Post-Processing Summary: Vocal coverage=%.1f%% (%.1fs vocal / %.1fs silence) | Pass 2 fixes=%d (clamped=%d, snapped=%d, split=%d, dropped=%d, bleeds=%d) | Pass 2.5 missed gaps=%zu | Pass 3 infilled=%d | Pass 3 re-anchored=%d",
-                  tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
-                  ac.total() - ac.infilled - ac.reanchored, ac.clamped, ac.snapped, ac.split, ac.dropped, ac.bleeds_pruned,
-                  tl_map.missing_vocal.size(), ac.infilled, ac.reanchored);
 
     std::fprintf(stderr,
                  "\n----------------------------------------\n"
@@ -454,34 +391,14 @@ int main(int argc, char** argv) {
                  "  1. Audio extraction:      %s\n"
                  "  2. Voice isolation:       %s\n"
                  "  3. Speech transcription:  %s\n"
-                 "  4. Silence sanitization:  %s\n"
-                 "  5. Targeted audio infill: %s\n"
                  "  Total time taken:         %s\n"
-                 "----------------------------------------\n"
-                 "Post-Processing Summary (Pass 2 & 3):\n"
-                 "  Vocal coverage:    %.1f%% (%.1fs vocal / %.1fs silence)\n"
-                 "  Cues processed:    %zu -> %zu\n"
-                 "  Pass 2 fixes:      %d applied\n"
-                 "    - Loop cues dropped:  %d\n"
-                 "    - Pruned bleeds:      %d\n"
-                 "    - Clamped trailing:   %d\n"
-                 "    - Snapped leading:    %d\n"
-                 "    - Split pauses:       %d\n"
-                 "    - Dropped halluc.:    %d\n"
-                 "  Missed vocal gaps: %zu detected\n"
-                 "  Pass 3 infilled:   %d recovered cues\n"
-                 "  Pass 3 re-anchored:%d displaced cues\n"
+                 "  Cues written:             %zu\n"
                  "----------------------------------------\n\n",
                  format_duration_hms(dur_phase1).c_str(),
                  format_duration_hms(dur_phase2).c_str(),
                  format_duration_hms(dur_phase3).c_str(),
-                 format_duration_hms(dur_phase4).c_str(),
-                 infill ? (tl_map.missing_vocal.empty() ? "00:00:00 (0 missed)" : format_duration_hms(dur_phase5).c_str()) : "N/A (disabled)",
                  format_duration_hms(dur_total).c_str(),
-                 tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
-                 orig_cue_count, segments.size(),
-                 ac.total() - ac.infilled - ac.reanchored, ac.loops_dropped, ac.bleeds_pruned, ac.clamped, ac.snapped, ac.split, ac.dropped,
-                 tl_map.missing_vocal.size(), ac.infilled, ac.reanchored);
+                 segments.size());
 
     // 6) Optional timing diagnostics (--debug): correlate VAD regions, whisper
     // cues, actual audio energy, and an optional reference SRT.
@@ -509,9 +426,6 @@ int main(int argc, char** argv) {
     std::vector<float>().swap(pcm);
     std::vector<srt::Segment>().swap(segments);
     std::vector<transcribe::VadRegion>().swap(vad_regions);
-    tl_map.intervals.clear(); tl_map.intervals.shrink_to_fit();
-    tl_map.actions.clear(); tl_map.actions.shrink_to_fit();
-    tl_map.missing_vocal.clear(); tl_map.missing_vocal.shrink_to_fit();
 
     return 0;
 }

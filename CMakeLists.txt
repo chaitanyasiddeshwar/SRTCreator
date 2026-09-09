@@ -9,27 +9,19 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # ---------------------------------------------------------------------------
-# whisper.cpp (vendored) with the CUDA backend.
-# We let whisper's own CMake resolve all ggml/CUDA linkage - linking the
-# `whisper` target pulls in ggml, ggml-cuda, cudart, cublas, etc. transitively.
+# whisper.cpp / ggml consumed as PREBUILT backend-DL DLLs (mirrors FFmpeg/ONNX).
+# The coherent DLL set (whisper.dll, ggml*.dll, ggml-cpu-*.dll, ggml-cuda.dll,
+# ggml-vulkan.dll + import libs + headers) is produced by the separate deps build
+# scripts/build-whisper-dlls.ps1 (CUDA Toolkit + Vulkan SDK; build machine / CI
+# only) and staged here. This app build is MSVC-only: NO CUDA/nvcc/Vulkan, no
+# add_subdirectory, no kernel compile. See modular_proposal.md 11.
 # ---------------------------------------------------------------------------
-set(GGML_CUDA              ON  CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS      OFF CACHE BOOL "" FORCE)   # static whisper/ggml into the exe
-set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(WHISPER_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 86)   # Ampere / RTX 3080 Ti (SM 8.6)
-endif()
-
-add_subdirectory(third_party/whisper.cpp)
-
-# MSVC 14.44 hits an Internal Compiler Error (C1001) optimizing whisper.cpp's
-# heavily-inlined std::thread callable at /O2 /Ob2. Reduce inlining for the
-# whisper host target only; the runtime hot path is the CUDA kernels, so this
-# has no meaningful performance cost.
-if(MSVC)
-  target_compile_options(whisper PRIVATE /Ob1)
+set(WHISPER_DIR "${CMAKE_SOURCE_DIR}/third_party/whisper")
+if(NOT EXISTS "${WHISPER_DIR}/include/whisper.h")
+  message(FATAL_ERROR
+    "Prebuilt whisper not found at ${WHISPER_DIR}.\n"
+    "Run scripts/build-whisper-dlls.ps1 to produce include\\, lib\\, bin\\ "
+    "(needs CUDA Toolkit + Vulkan SDK; see modular_proposal.md §11).")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -56,7 +48,6 @@ add_library(srtcore STATIC
   src/log.cpp
   src/separate.cpp
   src/debug.cpp
-  src/timeline.cpp
   src/segment_mode.cpp
 )
 target_include_directories(srtcore PUBLIC
@@ -64,11 +55,13 @@ target_include_directories(srtcore PUBLIC
   "${CMAKE_SOURCE_DIR}/third_party"
   "${FFMPEG_DIR}/include"
   "${ORT_DIR}/include"
-  "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/include"
-  "${CMAKE_SOURCE_DIR}/third_party/whisper.cpp/ggml/include"
+  "${WHISPER_DIR}/include"
 )
-target_link_directories(srtcore PUBLIC "${FFMPEG_DIR}/lib" "${ORT_DIR}/lib")
-target_link_libraries(srtcore PUBLIC whisper avformat avcodec avutil swresample onnxruntime)
+target_link_directories(srtcore PUBLIC "${FFMPEG_DIR}/lib" "${ORT_DIR}/lib" "${WHISPER_DIR}/lib")
+# whisper.lib -> whisper.dll (transcription). transcribe.cpp's backend/device
+# queries split across two ggml DLLs: ggml.dll (ggml_backend_load_all, dev_count/
+# get) and ggml-base.dll (dev_name/description/type, backend_reg, reg_name).
+target_link_libraries(srtcore PUBLIC whisper ggml ggml-base avformat avcodec avutil swresample onnxruntime)
 
 # CLI and GUI executables.
 add_executable(srt src/main.cpp)
@@ -87,9 +80,17 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# Stage runtime DLLs (FFmpeg + CUDA) next to each exe so they run from build\.
+# Stage runtime DLLs (whisper/ggml backends + FFmpeg + ONNX + CUDA runtime) next
+# to each exe so it runs from build\. ggml_backend_load_all() picks the best of
+# the ggml-*.dll backends present at runtime (CUDA -> Vulkan -> CPU).
 # ---------------------------------------------------------------------------
 function(stage_runtime_dlls tgt)
+  file(GLOB _wh "${WHISPER_DIR}/bin/*.dll")   # whisper.dll, ggml*.dll, ggml-cpu-*/cuda/vulkan
+  if(_wh)
+    add_custom_command(TARGET ${tgt} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_wh} $<TARGET_FILE_DIR:${tgt}>
+      COMMAND_EXPAND_LISTS)
+  endif()
   file(GLOB _ff "${FFMPEG_DIR}/bin/*.dll")
   if(_ff)
     add_custom_command(TARGET ${tgt} POST_BUILD

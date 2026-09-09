@@ -1,6 +1,7 @@
 #include "transcribe.h"
 
 #include "whisper.h"
+#include "ggml-backend.h"   // ggml_backend_load_all + device enumeration (GGML_BACKEND_DL)
 #include "log.h"
 
 #include <algorithm>
@@ -40,6 +41,32 @@ void whisper_log_cb(ggml_log_level level, const char* text, void* /*ud*/) {
 void install_whisper_logging() {
     static std::once_flag once;
     std::call_once(once, [] { whisper_log_set(whisper_log_cb, nullptr); });
+}
+
+// In a GGML_BACKEND_DL build the backends live in separate DLLs next to the exe
+// (ggml-cuda.dll / ggml-vulkan.dll / ggml-cpu-*.dll) and NONE are registered until
+// we ask ggml to load them. Must run before any whisper/ggml device use, once.
+void ensure_backends_loaded() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        ggml_backend_load_all();
+        logging::logf("INFO", "ggml: loaded %zu compute device(s) via dynamic backends",
+                      ggml_backend_dev_count());
+    });
+}
+
+const char* dev_type_str(enum ggml_backend_dev_type t) {
+    switch (t) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:   return "GPU";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:  return "iGPU";
+        case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "ACCEL";
+        default:                             return "other";
+    }
+}
+
+bool dev_is_gpu(enum ggml_backend_dev_type t) {
+    return t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU;
 }
 
 // Fired by whisper as new segments are decoded; forwards each to on_segment.
@@ -111,11 +138,43 @@ bool Session::is_valid() const {
 bool Session::init(const Options& opts, std::string& err) {
     close();
     install_whisper_logging();
+    ensure_backends_loaded();   // register the plugin backend DLLs before device use
+
+    // available_devices() returns GPUs first (ggml order) then CPU, so a GPU's list
+    // index equals whisper's gpu_device (the index among GPU-type devices), and the
+    // CPU entry maps to use_gpu=false. Only backends whose DLL actually loaded appear.
+    std::vector<DeviceInfo> devs = available_devices();
+    std::string report;
+    for (const auto& d : devs) {
+        if (!report.empty()) report += ", ";
+        report += d.name + " (" + (d.is_gpu ? "GPU" : "CPU") + ")";
+    }
+
+    // Resolve the requested device. -1 (auto) = the best GPU if any, else CPU.
+    bool has_gpu = !devs.empty() && devs.front().is_gpu;
+    int  sel     = opts.device_index;
+    bool use_gpu;
+    int  gpu_dev = 0;
+    std::string chosen;
+    if (sel >= 0 && sel < (int)devs.size()) {
+        use_gpu = devs[sel].is_gpu;
+        gpu_dev = use_gpu ? sel : 0;    // GPUs are first, so list index == gpu_device
+        chosen  = devs[sel].name + (use_gpu ? " (forced GPU)" : " (forced CPU)");
+    } else {
+        use_gpu = has_gpu;
+        chosen  = has_gpu ? (devs.front().name + " (auto)") : "CPU (auto, no GPU backend found)";
+    }
+    logging::logf("INFO", "backends: %s -> using %s", report.c_str(), chosen.c_str());
+    std::fprintf(stderr, "[srt] compute backends: %s -> %s\n", report.c_str(), chosen.c_str());
+    if (!has_gpu && sel < 0) {
+        std::fprintf(stderr, "[srt] no GPU backend found - running on CPU (slower). "
+                             "Drop ggml-cuda.dll or ggml-vulkan.dll next to the exe for GPU.\n");
+    }
 
     whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu    = true;
+    cparams.use_gpu    = use_gpu;
     cparams.flash_attn = opts.flash_attn;
-    cparams.gpu_device = 0;
+    cparams.gpu_device = gpu_dev;
 
     ctx_ = whisper_init_from_file_with_params(opts.model_path.c_str(), cparams);
     if (!ctx_) {
@@ -413,6 +472,29 @@ bool run(const std::vector<float>& pcm, const Options& opts,
     Session session;
     if (!session.init(opts, err)) return false;
     return session.transcribe(pcm, opts, out, err);
+}
+
+std::vector<DeviceInfo> available_devices() {
+    ensure_backends_loaded();
+    std::vector<DeviceInfo> gpus, cpus;
+    size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        enum ggml_backend_dev_type t = ggml_backend_dev_type(d);
+        DeviceInfo di;
+        const char* name = ggml_backend_dev_name(d);
+        const char* desc = ggml_backend_dev_description(d);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d);
+        const char* rn = reg ? ggml_backend_reg_name(reg) : nullptr;
+        di.name        = name ? name : "?";
+        di.description = desc ? desc : "";
+        di.backend     = rn ? rn : di.name;
+        di.is_gpu      = dev_is_gpu(t);
+        (di.is_gpu ? gpus : cpus).push_back(std::move(di));
+    }
+    // GPUs first (that is the whisper selection order too), then CPU.
+    gpus.insert(gpus.end(), cpus.begin(), cpus.end());
+    return gpus;
 }
 
 } // namespace transcribe

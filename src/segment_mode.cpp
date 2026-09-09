@@ -134,9 +134,7 @@ bool run(const std::vector<float>& pcm,
         + std::to_string((int)total_sec) + "s of audio");
 
     // Export the detected speech regions (original timeline) if the caller wants them,
-    // so the --debug report can correlate VAD regions vs cues in segment mode too.
-    // NOTE: callers must gate the legacy Pass 2/3 block on the mode flag, not on
-    // vad_regions being empty, since we now populate it here.
+    // so the --debug report can correlate VAD regions vs cues.
     if (base_topts.vad_regions) {
         base_topts.vad_regions->clear();
         for (int i = 0; i < n; ++i)

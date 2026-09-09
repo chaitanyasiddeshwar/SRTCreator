@@ -1,73 +1,101 @@
-# Package a self-contained SRTCreator distribution zip.
-#   scripts\package.ps1                 # default version
-#   scripts\package.ps1 -Version 0.2.0
-#
-# Bundles srt.exe + exactly the runtime DLLs it needs (FFmpeg, CUDA, VC++),
-# plus README and license notices. Whisper models are NOT bundled - they are
-# downloaded on first run. Requires a prior successful build (build\srt.exe).
+<#
+.SYNOPSIS
+    Assemble the tiered SRTCreator distribution (modular_proposal.md 3.3):
+
+      SRTCreator-v<ver>-win64-base.zip        universal, runs on ANY win64
+        srt.exe, srtgui.exe, whisper.dll, ggml(.dll/-base/-cpu-*),
+        FFmpeg + onnxruntime + DirectML, VC++ runtime, docs + LICENSES.
+        CPU transcription + DirectML vocal isolation. No GPU transcription.
+
+      SRTCreator-v<ver>-win64-cuda-pack.zip   NVIDIA power pack (~500 MB)
+        ggml-cuda.dll + cudart/cublas/cublasLt. Unzip next to srt.exe.
+
+      SRTCreator-v<ver>-win64-vulkan-pack.zip universal GPU pack (~few MB)
+        ggml-vulkan.dll. Unzip next to srt.exe. Any modern GPU, driver only.
+
+    A GPU pack is additive: ggml_backend_load_all() detects the dropped-in DLL and
+    the app auto-selects it (CUDA -> Vulkan -> CPU). Pull everything from build\,
+    which already staged the exact runtime set. Requires a prior successful build.
+
+.PARAMETER Version  Distribution version (default: dependencies.json app.version).
+.PARAMETER Root     Repo root (default: parent of this script's dir).
+#>
 param(
-    [string]$Version = "0.1.0",
+    [string]$Version = "",
     [string]$Root    = (Split-Path -Parent $PSScriptRoot)
 )
 $ErrorActionPreference = "Stop"
 
+if (-not $Version) {
+    $Version = (Get-Content (Join-Path $Root "dependencies.json") -Raw | ConvertFrom-Json).app.version
+}
 $build = Join-Path $Root "build"
-$exe   = Join-Path $build "srt.exe"
-if (-not (Test-Path $exe)) { throw "srt.exe not found in build\. Run build.bat first." }
+if (-not (Test-Path (Join-Path $build "srt.exe"))) { throw "build\srt.exe not found. Run build.bat first." }
 
-$cuda  = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0" }
-$ffbin = Join-Path $Root "third_party\ffmpeg\bin"
-$sys   = Join-Path $env:WINDIR "System32"
+$dist = Join-Path $Root "dist"
+if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
+New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
-$dist  = Join-Path $Root "dist"
-$stage = Join-Path $dist "SRTCreator"
-if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-# 1) The executables (CLI + GUI).
-Copy-Item $exe $stage
-$gui = Join-Path $build "srtgui.exe"
-if (Test-Path $gui) { Copy-Item $gui $stage }
-
-# 2) FFmpeg DLLs - exactly the four the exe links (not avfilter/avdevice/swscale).
-foreach ($d in "avformat-63.dll","avcodec-63.dll","avutil-61.dll","swresample-7.dll") {
-    Copy-Item (Join-Path $ffbin $d) $stage
+# Copy files matching any of $patterns from $srcDir into $destDir (must find each).
+function Copy-Set([string]$srcDir, [string[]]$patterns, [string]$destDir) {
+    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    foreach ($pat in $patterns) {
+        $hits = Get-ChildItem -Path (Join-Path $srcDir $pat) -ErrorAction SilentlyContinue
+        if (-not $hits) { throw "package: no match for '$pat' in $srcDir" }
+        $hits | ForEach-Object { Copy-Item $_.FullName $destDir -Force }
+    }
+}
+function Zip([string]$stageDir, [string]$zipName) {
+    $zip = Join-Path $dist $zipName
+    Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zip -Force
+    "{0,-42} {1,7:N1} MB" -f $zipName, ((Get-Item $zip).Length/1MB)
 }
 
-# 3) CUDA runtime DLLs (CUDA 13 ships them in bin\x64; CUDA 12 in bin).
-function Find-Cuda([string]$pat) {
-    $hit = Get-ChildItem -Path (Join-Path $cuda "bin\x64"),(Join-Path $cuda "bin") -Filter $pat -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $hit) { throw "CUDA DLL not found: $pat (looked under $cuda)" }
-    return $hit.FullName
+# ---------------- base ----------------
+$baseStage = Join-Path $dist "SRTCreator"
+Copy-Set $build @("srt.exe","srtgui.exe") $baseStage
+# whisper + ggml core + ALL cpu variants (no cuda/vulkan)
+Copy-Set $build @("whisper.dll","ggml.dll","ggml-base.dll","ggml-cpu-*.dll") $baseStage
+# FFmpeg (the four the exe links) + ONNX + DirectML
+Copy-Set $build @("avformat-*.dll","avcodec-*.dll","avutil-*.dll","swresample-*.dll",
+                  "onnxruntime.dll","DirectML.dll") $baseStage
+# VC++ runtime (app-local, avoids requiring the VC++ Redist install)
+$sys = Join-Path $env:WINDIR "System32"
+Copy-Set $sys @("MSVCP140.dll","VCRUNTIME140.dll","VCRUNTIME140_1.dll","VCOMP140.dll") $baseStage
+# docs + licenses
+Copy-Item (Join-Path $Root "README.md") $baseStage -Force
+Copy-Item (Join-Path $Root "dependencies.json") $baseStage -Force
+Copy-Item (Join-Path $Root "LICENSES") (Join-Path $baseStage "LICENSES") -Recurse -Force
+if (Test-Path (Join-Path $Root "third_party\whisper.cpp\LICENSE")) {
+    Copy-Item (Join-Path $Root "third_party\whisper.cpp\LICENSE") (Join-Path $baseStage "LICENSES\LICENSE-whisper.txt") -Force
 }
-foreach ($p in "cudart64_*.dll","cublas64_*.dll","cublasLt64_*.dll") {
-    Copy-Item (Find-Cuda $p) $stage
+if (Test-Path (Join-Path $Root "third_party\ffmpeg\LICENSE.txt")) {
+    Copy-Item (Join-Path $Root "third_party\ffmpeg\LICENSE.txt") (Join-Path $baseStage "LICENSES\LICENSE-ffmpeg.txt") -Force
 }
 
-# 4) Visual C++ runtime (app-local; avoids requiring the VC++ Redist install).
-foreach ($d in "MSVCP140.dll","VCRUNTIME140.dll","VCRUNTIME140_1.dll","VCOMP140.dll") {
-    Copy-Item (Join-Path $sys $d) $stage
-}
+# ---------------- CUDA pack ----------------
+$cudaStage = Join-Path $dist "cuda-pack"
+Copy-Set $build @("ggml-cuda.dll","cudart64_*.dll","cublas64_*.dll","cublasLt64_*.dll") $cudaStage
+Set-Content (Join-Path $cudaStage "README-CUDA-PACK.txt") @"
+SRTCreator NVIDIA (CUDA) GPU pack.
+Unzip these files NEXT TO srt.exe / srtgui.exe (same folder as the base download).
+The app detects ggml-cuda.dll on startup and uses your NVIDIA GPU automatically.
+Requires an NVIDIA driver only (no CUDA Toolkit install).
+"@
 
-# 4b) ONNX Runtime (DirectML) for vocal isolation.
-$ortbin = Join-Path $Root "third_party\onnxruntime\bin"
-foreach ($d in "onnxruntime.dll","DirectML.dll") {
-    $p = Join-Path $ortbin $d
-    if (Test-Path $p) { Copy-Item $p $stage }
-}
+# ---------------- Vulkan pack ----------------
+$vkStage = Join-Path $dist "vulkan-pack"
+Copy-Set $build @("ggml-vulkan.dll") $vkStage
+Set-Content (Join-Path $vkStage "README-VULKAN-PACK.txt") @"
+SRTCreator Vulkan GPU pack (any modern GPU - NVIDIA / AMD / Intel).
+Unzip ggml-vulkan.dll NEXT TO srt.exe / srtgui.exe (same folder as the base download).
+The app detects it on startup and uses your GPU via the Vulkan driver (already
+installed with any recent GPU driver). No SDK or extra runtime needed.
+"@
 
-# 5) Docs + licenses.
-Copy-Item (Join-Path $Root "README.md") $stage
-Copy-Item (Join-Path $Root "THIRD_PARTY_NOTICES.txt") $stage
-Copy-Item (Join-Path $Root "third_party\whisper.cpp\LICENSE") (Join-Path $stage "LICENSE-whisper.txt")
-Copy-Item (Join-Path $Root "third_party\ffmpeg\LICENSE.txt")   (Join-Path $stage "LICENSE-ffmpeg.txt")
-
-# 6) Zip it.
-$zip = Join-Path $dist ("SRTCreator-v{0}-win64-cuda.zip" -f $Version)
-if (Test-Path $zip) { Remove-Item $zip }
-Compress-Archive -Path $stage -DestinationPath $zip
-
+# ---------------- zip ----------------
 Write-Host ""
-Write-Host "Packaged: $zip"
-Get-ChildItem $stage | Select-Object Name,@{n="KB";e={[math]::Round($_.Length/1KB)}} | Format-Table -AutoSize
-Write-Host ("Zip size: {0:N1} MB" -f ((Get-Item $zip).Length/1MB))
+Write-Host "Packaged (dist\):"
+Zip $baseStage ("SRTCreator-v{0}-win64-base.zip"        -f $Version)
+Zip $cudaStage ("SRTCreator-v{0}-win64-cuda-pack.zip"   -f $Version)
+Zip $vkStage   ("SRTCreator-v{0}-win64-vulkan-pack.zip" -f $Version)

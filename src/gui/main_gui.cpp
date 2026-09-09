@@ -25,7 +25,6 @@
 #include "separate.h"
 #include "log.h"
 #include "debug.h"
-#include "timeline.h"
 #include "segment_mode.h"
 
 static std::wstring format_duration_hms_w(double seconds) {
@@ -64,14 +63,19 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define WM_APP_DONE     (WM_APP + 5) // lParam = wchar_t* ; wParam = success
 
 enum {
-    ID_TRANSLATE = 1001, ID_CENTER, ID_DUMP, ID_DEBUG, ID_MULTIPASS,
-    ID_MODEL, ID_LANG, ID_VMODEL, ID_EDIT, ID_PROGRESS, ID_STATUS,
+    ID_TRANSLATE = 1001, ID_CENTER, ID_DUMP, ID_DEBUG,
+    ID_MODEL, ID_LANG, ID_VMODEL, ID_BACKEND, ID_EDIT, ID_PROGRESS, ID_STATUS,
     ID_INPUT, ID_INPUT_BROWSE, ID_OUTPUT, ID_OUTPUT_BROWSE, ID_START
 };
 
 static HWND g_status;
 static HWND g_input_lbl, g_input, g_input_browse, g_output_lbl, g_output, g_output_browse;
-static HWND g_translate, g_center, g_dump, g_debug, g_multipass;
+static HWND g_translate, g_center, g_dump, g_debug;
+static HWND g_backend_lbl, g_backend;
+// Maps Backend dropdown item index -> transcribe device_index (-1 = auto). Filled
+// from transcribe::available_devices() at startup so only backends whose DLL
+// actually loaded (correct CUDA runtime/driver, or Vulkan driver) are offered.
+static std::vector<int> g_backend_map;
 static HWND g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel, g_start;
 static HWND g_edit, g_progress;
 static HWND g_tip = nullptr; // shared tooltip control for the checkboxes
@@ -122,8 +126,9 @@ struct Job {
     HWND hwnd;
     std::wstring input, output;
     std::string model, language, vocal_model;
-    bool translate, flash, word_ts, center, infill, dump_audio, debug, segmode;
+    bool translate, flash, word_ts, center, dump_audio, debug;
     int max_line_length;
+    int device_index;   // -1 = auto; else index into transcribe::available_devices()
 };
 
 static void do_job(Job job) {
@@ -131,9 +136,9 @@ static void do_job(Job job) {
     std::string input = to_utf8(job.input);
     std::string err;
 
-    logging::logf("INFO", "job: input=%s out=%s model=%s lang=%s translate=%d center=%d infill=%d wrap=%d",
+    logging::logf("INFO", "job: input=%s out=%s model=%s lang=%s translate=%d center=%d wrap=%d",
                   input.c_str(), to_utf8(job.output).c_str(), job.model.c_str(), job.language.c_str(),
-                  (int)job.translate, (int)job.center, (int)job.infill, job.max_line_length);
+                  (int)job.translate, (int)job.center, job.max_line_length);
 
     std::string models_dir = models::default_models_dir();
     auto dl = [hwnd](int pct) { PostMessageW(hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0); };
@@ -158,9 +163,7 @@ static void do_job(Job job) {
     auto t_job_start = std::chrono::steady_clock::now();
     double dur_phase1 = 0.0; // Audio/center channel extraction
     double dur_phase2 = 0.0; // Voice isolation
-    double dur_phase3 = 0.0; // Speech transcription (Pass 1)
-    double dur_phase4 = 0.0; // Silence sanitization (Pass 2)
-    double dur_phase5 = 0.0; // Targeted audio infill (Pass 3)
+    double dur_phase3 = 0.0; // Speech transcription
 
     PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0);
     auto prog = [hwnd](int pct) { PostMessageW(hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0); };
@@ -169,7 +172,6 @@ static void do_job(Job job) {
     std::vector<float> vocals;
     std::vector<srt::Segment> segments;
     std::vector<transcribe::VadRegion> vad_regions;
-    timeline::TimelineMap tl_map;
 
     struct JobCleanup {
         std::vector<float>& pcm;
@@ -177,20 +179,16 @@ static void do_job(Job job) {
         std::vector<float>& vocals;
         std::vector<srt::Segment>& segments;
         std::vector<transcribe::VadRegion>& vad_regions;
-        timeline::TimelineMap& tl_map;
         ~JobCleanup() {
             std::vector<float>().swap(pcm);
             std::vector<float>().swap(mix);
             std::vector<float>().swap(vocals);
             std::vector<srt::Segment>().swap(segments);
             std::vector<transcribe::VadRegion>().swap(vad_regions);
-            tl_map.intervals.clear(); tl_map.intervals.shrink_to_fit();
-            tl_map.actions.clear(); tl_map.actions.shrink_to_fit();
-            tl_map.missing_vocal.clear(); tl_map.missing_vocal.shrink_to_fit();
             SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
             logging::info("memory: cleaned up all audio buffers and trimmed working set");
         }
-    } cleanup{pcm, mix, vocals, segments, vad_regions, tl_map};
+    } cleanup{pcm, mix, vocals, segments, vad_regions};
 
     // Cache: reuse a 16k mono whisper input sitting next to the movie (a prior run's
     // dump, or the CLI's) to skip decode + isolation entirely - mirrors main.cpp
@@ -297,6 +295,7 @@ static void do_job(Job job) {
     t.vad             = true;
     t.vad_model_path  = vad_path;
     t.word_timestamps = job.word_ts;
+    t.device_index    = job.device_index;   // GUI Backend picker (-1 = auto)
     t.vad_regions     = &vad_regions;
     t.on_progress = [hwnd](int pct) { PostMessageW(hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0); };
     // Dedup the live transcript the same way the SRT writer does, so the scrolling
@@ -316,13 +315,13 @@ static void do_job(Job job) {
         post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
         return;
     }
-    if (job.segmode) {
-        // EXPERIMENTAL: VAD-segmented per-region transcription (see segment_mode.*).
-        // Leaves vad_regions empty so the Pass 2/3 block below is skipped. Progress
-        // and live cues are driven by segment_mode's region-level callbacks (the same
-        // progress bar / transcript panel the default path uses).
-        post_str(hwnd, WM_APP_STATUS, 0, L"Transcribing (segment mode)…");
-        post_str(hwnd, WM_APP_SEGMENT, 0, L"[segment] VAD-segmented per-region transcription\r\n");
+    // VAD-segmented per-region transcription (see segment_mode.*): each detected
+    // speech region is transcribed in isolation, so cue timing is region_start +
+    // local time with no whisper-VAD concatenation seam. Progress and live cues are
+    // driven by segment_mode's region-level callbacks.
+    post_str(hwnd, WM_APP_STATUS, 0, L"Transcribing (segment mode)…");
+    post_str(hwnd, WM_APP_SEGMENT, 0, L"[segment] VAD-segmented per-region transcription\r\n");
+    {
         segment_mode::Options sopts;
         sopts.vad_model_path = vad_path;
         if (!segment_mode::run(pcm, session, t, sopts, segments, err,
@@ -339,11 +338,6 @@ static void do_job(Job job) {
             post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
             return;
         }
-    } else if (!session.transcribe(pcm, t, segments, err)) {
-        logging::error("transcribe failed: " + err);
-        session.close();
-        post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
-        return;
     }
 
     auto t_p3_end = std::chrono::steady_clock::now();
@@ -352,111 +346,30 @@ static void do_job(Job job) {
                   format_duration_hms(dur_phase3).c_str(), dur_phase3);
     post_str(hwnd, WM_APP_SEGMENT, 0,
              L"[timing] Phase 3 (Transcription): " + format_duration_hms_w(dur_phase3) + L"\r\n");
-    logging::logf("INFO", "transcribed %zu raw segments", segments.size());
+    logging::logf("INFO", "transcribed %zu segments", segments.size());
 
-    // Pass 2: Sanitize cues & split mid-sentence pauses against timeline
-    size_t orig_cue_count = segments.size();
     std::wstring out = job.output.empty() ? derive_srt(job.input) : job.output;
-    std::string out_utf8 = to_utf8(out);
-    size_t dot_pos = out_utf8.find_last_of('.');
-    std::string json_path = (dot_pos == std::string::npos ? out_utf8 : out_utf8.substr(0, dot_pos)) + ".timeline.json";
-
-    if (!job.segmode && !vad_regions.empty()) {
-        post_str(hwnd, WM_APP_STATUS, 0, L"Pass 2: Sanitizing cues against timeline…");
-        auto t_p4_start = std::chrono::steady_clock::now();
-        tl_map = timeline::build_timeline(input, pcm, vad_regions);
-        timeline::eliminate_boundary_bleeds(segments, tl_map, pcm, session, t, [hwnd](const std::string& msg) {
-            post_str(hwnd, WM_APP_SEGMENT, 0, L"[bleed] " + to_wide(msg) + L"\r\n");
-        });
-        timeline::sanitize_and_split(segments, tl_map, 1.5);
-        timeline::find_missing_vocal_regions(segments, tl_map, 0.8, 0.20);
-        auto t_p4_end = std::chrono::steady_clock::now();
-        dur_phase4 = std::chrono::duration<double>(t_p4_end - t_p4_start).count();
-        logging::logf("INFO", "Phase 4 (Silence sanitization) completed in %s (%.2fs)",
-                      format_duration_hms(dur_phase4).c_str(), dur_phase4);
-        post_str(hwnd, WM_APP_SEGMENT, 0,
-                 L"[timing] Phase 4 (Silence sanitization): " + format_duration_hms_w(dur_phase4) + L"\r\n");
-
-        auto ac_p2 = timeline::count_actions(tl_map);
-        logging::logf("INFO", "Pass 2 sanitation: %d actions applied (cues: %zu -> %zu)",
-                      ac_p2.total(), orig_cue_count, segments.size());
-        post_str(hwnd, WM_APP_SEGMENT, 0,
-                 L"[timeline] Pass 2 applied " + std::to_wstring(ac_p2.total()) +
-                 L" timing fixes (cues: " + std::to_wstring(orig_cue_count) + L" -> " +
-                 std::to_wstring(segments.size()) + L")\r\n");
-
-        if (job.infill && !tl_map.missing_vocal.empty()) {
-            post_str(hwnd, WM_APP_STATUS, 0, L"Pass 3: Infilling missed speech…");
-            post_str(hwnd, WM_APP_SEGMENT, 0,
-                     L"[timeline] Pass 3 checking " + std::to_wstring(tl_map.missing_vocal.size()) +
-                     L" potential missed speech regions...\r\n");
-
-            auto t_p5_start = std::chrono::steady_clock::now();
-            timeline::infill_missing_regions(pcm, session, t, tl_map, segments, [hwnd](const std::string& msg) {
-                post_str(hwnd, WM_APP_SEGMENT, 0, L"[infill] " + to_wide(msg) + L"\r\n");
-            });
-            auto t_p5_end = std::chrono::steady_clock::now();
-            dur_phase5 = std::chrono::duration<double>(t_p5_end - t_p5_start).count();
-            logging::logf("INFO", "Phase 5 (Targeted audio infill) completed in %s (%.2fs)",
-                          format_duration_hms(dur_phase5).c_str(), dur_phase5);
-            post_str(hwnd, WM_APP_SEGMENT, 0,
-                     L"[timing] Phase 5 (Targeted audio infill): " + format_duration_hms_w(dur_phase5) + L"\r\n");
-        }
-
-        std::string jerr;
-        if (timeline::write_json(tl_map, json_path, jerr)) {
-            logging::info("wrote timeline json: " + json_path);
-            post_str(hwnd, WM_APP_SEGMENT, 0, L"[timeline] wrote analysis: " + to_wide(json_path) + L"\r\n");
-        } else {
-            logging::error("failed to write timeline json: " + jerr);
-        }
-    }
 
     session.close(); // explicitly release Whisper model and reset CUDA device memory
 
     auto t_job_end = std::chrono::steady_clock::now();
     double dur_total = std::chrono::duration<double>(t_job_end - t_job_start).count();
-    auto ac = timeline::count_actions(tl_map);
 
-    // Log complete timing summary
-    logging::logf("INFO", "Timing Summary: 1.Audio extraction=%s (%.2fs) | 2.Voice isolation=%s (%.2fs) | 3.Transcription=%s (%.2fs) | 4.Silence sanitize=%s (%.2fs) | 5.Targeted infill=%s | Total=%s (%.2fs)",
+    logging::logf("INFO", "Timing Summary: 1.Audio extraction=%s (%.2fs) | 2.Voice isolation=%s (%.2fs) | 3.Transcription=%s (%.2fs) | Total=%s (%.2fs)",
                   format_duration_hms(dur_phase1).c_str(), dur_phase1,
                   format_duration_hms(dur_phase2).c_str(), dur_phase2,
                   format_duration_hms(dur_phase3).c_str(), dur_phase3,
-                  format_duration_hms(dur_phase4).c_str(), dur_phase4,
-                  job.infill ? (tl_map.missing_vocal.empty() ? "N/A (0 missed)" : (format_duration_hms(dur_phase5) + " (" + std::to_string((int)dur_phase5) + "s)").c_str()) : "N/A (disabled)",
                   format_duration_hms(dur_total).c_str(), dur_total);
 
-    logging::logf("INFO", "Post-Processing Summary: Vocal coverage=%.1f%% (%.1fs vocal / %.1fs silence) | Pass 2 fixes=%d (clamped=%d, snapped=%d, split=%d, dropped=%d, bleeds=%d) | Pass 2.5 missed gaps=%zu | Pass 3 infilled=%d | Pass 3 re-anchored=%d",
-                  tl_map.analysis.vocal_coverage_pct, tl_map.analysis.total_vocal_sec, tl_map.analysis.total_silence_sec,
-                  ac.total() - ac.infilled - ac.reanchored, ac.clamped, ac.snapped, ac.split, ac.dropped, ac.bleeds_pruned,
-                  tl_map.missing_vocal.size(), ac.infilled, ac.reanchored);
-
-    // Append Timing Summary and Post-Processing Summary block to scrolling subtitle area (g_edit)
+    // Append the timing summary to the scrolling transcript area (g_edit).
     std::wstring summary =
         L"\r\n----------------------------------------\r\n"
         L"Timing Summary:\r\n"
         L"  1. Audio extraction:      " + format_duration_hms_w(dur_phase1) + L"\r\n"
         L"  2. Voice isolation:       " + format_duration_hms_w(dur_phase2) + L"\r\n"
         L"  3. Speech transcription:  " + format_duration_hms_w(dur_phase3) + L"\r\n"
-        L"  4. Silence sanitization:  " + format_duration_hms_w(dur_phase4) + L"\r\n"
-        L"  5. Targeted audio infill: " + (job.infill ? (tl_map.missing_vocal.empty() ? L"00:00:00 (0 missed)" : format_duration_hms_w(dur_phase5)) : L"N/A (disabled)") + L"\r\n"
         L"  Total time taken:         " + format_duration_hms_w(dur_total) + L"\r\n"
-        L"----------------------------------------\r\n"
-        L"Post-Processing Summary (Pass 2 & 3):\r\n"
-        L"  Vocal coverage:    " + std::to_wstring((int)(tl_map.analysis.vocal_coverage_pct + 0.5)) + L"% (" +
-        std::to_wstring((int)(tl_map.analysis.total_vocal_sec + 0.5)) + L"s vocal / " +
-        std::to_wstring((int)(tl_map.analysis.total_silence_sec + 0.5)) + L"s silence)\r\n"
-        L"  Cues processed:    " + std::to_wstring(orig_cue_count) + L" -> " + std::to_wstring(segments.size()) + L"\r\n"
-        L"  Pass 2 fixes:      " + std::to_wstring(ac.total() - ac.infilled - ac.reanchored) + L" applied\r\n"
-        L"    - Pruned bleeds:      " + std::to_wstring(ac.bleeds_pruned) + L"\r\n"
-        L"    - Clamped trailing:   " + std::to_wstring(ac.clamped) + L"\r\n"
-        L"    - Snapped leading:    " + std::to_wstring(ac.snapped) + L"\r\n"
-        L"    - Split pauses:       " + std::to_wstring(ac.split) + L"\r\n"
-        L"    - Dropped halluc.:    " + std::to_wstring(ac.dropped) + L"\r\n"
-        L"  Missed vocal gaps: " + std::to_wstring(tl_map.missing_vocal.size()) + L" detected\r\n"
-        L"  Pass 3 infilled:   " + std::to_wstring(ac.infilled) + L" recovered cues\r\n"
-        L"  Pass 3 re-anchored:" + std::to_wstring(ac.reanchored) + L" displaced cues\r\n"
+        L"  Cues written:             " + std::to_wstring(segments.size()) + L"\r\n"
         L"----------------------------------------\r\n\r\n";
     post_str(hwnd, WM_APP_SEGMENT, 0, summary);
 
@@ -532,12 +445,13 @@ static void start_job(HWND hwnd) {
     job.flash       = true;   // always on
     job.word_ts     = true;   // always on (DTW word timing)
     job.center      = checked(g_center);
-    job.infill      = true;   // always on; effective in multi-pass mode only
     job.dump_audio  = checked(g_dump);
     job.debug       = checked(g_debug);
-    // Segment mode is the default; the checkbox opts INTO the legacy multi-pass pipeline.
-    job.segmode     = !checked(g_multipass);
     job.max_line_length = 42; // line wrapping always on
+    {   // Backend picker -> device_index (-1 auto). Map is empty only if enumeration failed.
+        int bi = (int)SendMessageW(g_backend, CB_GETCURSEL, 0, 0);
+        job.device_index = (bi >= 0 && bi < (int)g_backend_map.size()) ? g_backend_map[bi] : -1;
+    }
     set_busy(true);
     std::thread(run_job, job).detach();
 }
@@ -585,16 +499,18 @@ static void layout(HWND hwnd) {
     // Checkbox row 1: pipeline options.
     int x = m;
     struct { HWND h; int w; } r1[] = {
-        {g_translate, 170}, {g_center, 210}, {g_multipass, 210}
+        {g_translate, 170}, {g_center, 210}
     };
     for (auto& c : r1) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 16; }
     y += 28;
-    // Checkbox row 2: debug options.
+    // Checkbox row 2: debug options + the backend picker.
     x = m;
     struct { HWND h; int w; } r2[] = {
         {g_dump, 175}, {g_debug, 150}
     };
     for (auto& c : r2) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 16; }
+    MoveWindow(g_backend_lbl, x, y + 4, 68, 18, TRUE); x += 72;
+    MoveWindow(g_backend, x, y, 250, 300, TRUE);
     y += 32;
 
     // Model / language / vocal-model / Start.
@@ -643,7 +559,7 @@ static void create_tooltips(HWND hwnd) {
     add_tip(hwnd, g_center,    L"Extract only the front-center channel (where dialogue sits in 5.1/7.1 mixes) before vocal isolation. Turn off to isolate from the full stereo downmix.");
     add_tip(hwnd, g_dump,      L"Write the exact 16 kHz mono audio fed to Whisper next to the input (<stem>.vocals16k.wav), for debugging.");
     add_tip(hwnd, g_debug,     L"Write a detailed timing/diagnostics report next to the output SRT.");
-    add_tip(hwnd, g_multipass, L"Use the legacy multi-pass timeline pipeline: transcribe the whole track at once, then sanitize timing and infill gaps. Leave unchecked for the default segment mode, which transcribes each detected speech region in isolation for tighter timing.");
+    add_tip(hwnd, g_backend,   L"Compute backend for transcription. Only backends detected on this machine are listed (CUDA needs an NVIDIA GPU + matching runtime; Vulkan needs a modern GPU driver; CPU always works). 'Auto (best)' picks the fastest available (CUDA > Vulkan > CPU).");
 }
 
 static HWND mk(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
@@ -662,14 +578,13 @@ static void create_controls(HWND hwnd) {
     g_output       = mk(hwnd, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER, ID_OUTPUT);
     g_output_browse= mk(hwnd, L"BUTTON", L"Browse…", BS_PUSHBUTTON, ID_OUTPUT_BROWSE);
 
-    // Only user-meaningful toggles are exposed. Flash attention, DTW word timestamps,
-    // line wrapping (42) and Pass 3 infill are always on (infill applies in multi-pass
-    // mode only) and are set unconditionally in the job, not shown as checkboxes.
+    // Only user-meaningful toggles are exposed. Flash attention, DTW word timestamps
+    // and line wrapping (42) are always on and are set unconditionally in the job,
+    // not shown as checkboxes.
     g_translate = mk(hwnd, L"BUTTON", L"Translate → English",       BS_AUTOCHECKBOX, ID_TRANSLATE);
     g_center    = mk(hwnd, L"BUTTON", L"Center channel (dialogue)", BS_AUTOCHECKBOX, ID_CENTER);
     g_dump      = mk(hwnd, L"BUTTON", L"Dump audio (debug)",        BS_AUTOCHECKBOX, ID_DUMP);
     g_debug     = mk(hwnd, L"BUTTON", L"Debug report",              BS_AUTOCHECKBOX, ID_DEBUG);
-    g_multipass = mk(hwnd, L"BUTTON", L"Multi-pass mode (legacy)",  BS_AUTOCHECKBOX, ID_MULTIPASS);
     // Center channel OFF by default (user preference): isolate from the full stereo
     // downmix. Tick it to extract only the Front-Center channel first. The baseline
     // harness scores center-on slightly higher, but center-off captures more side
@@ -696,6 +611,25 @@ static void create_controls(HWND hwnd) {
         SendMessageW(g_vmodel, CB_ADDSTRING, 0, (LPARAM)to_wide(mi.name).c_str());
     SendMessageW(g_vmodel, CB_SETCURSEL, 0, 0);
 
+    // Backend picker - dynamic: enumerate the compute devices ggml actually loaded
+    // (CUDA appears only if ggml-cuda.dll + a matching runtime/driver loaded; Vulkan
+    // if the driver supports it; CPU always). "Auto (best)" lets the app choose.
+    g_backend_lbl = mk(hwnd, L"STATIC", L"Backend:", SS_LEFT, 0);
+    g_backend = mk(hwnd, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_BACKEND);
+    g_backend_map.clear();
+    SendMessageW(g_backend, CB_ADDSTRING, 0, (LPARAM)L"Auto (best)");
+    g_backend_map.push_back(-1);
+    {
+        auto devs = transcribe::available_devices();
+        for (size_t i = 0; i < devs.size(); ++i) {
+            std::wstring label = to_wide(devs[i].name);
+            if (!devs[i].description.empty()) label += L" - " + to_wide(devs[i].description);
+            SendMessageW(g_backend, CB_ADDSTRING, 0, (LPARAM)label.c_str());
+            g_backend_map.push_back((int)i);
+        }
+    }
+    SendMessageW(g_backend, CB_SETCURSEL, 0, 0);   // default: Auto
+
     g_start = mk(hwnd, L"BUTTON", L"Start", BS_DEFPUSHBUTTON, ID_START);
 
     g_edit = mk(hwnd, L"EDIT", L"",
@@ -706,7 +640,8 @@ static void create_controls(HWND hwnd) {
 
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     for (HWND h : { g_status, g_input_lbl, g_input, g_input_browse, g_output_lbl, g_output,
-                    g_output_browse, g_translate, g_center, g_dump, g_debug, g_multipass,
+                    g_output_browse, g_translate, g_center, g_dump, g_debug,
+                    g_backend_lbl, g_backend,
                     g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel,
                     g_start, g_edit })
         SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
@@ -716,7 +651,7 @@ static void create_controls(HWND hwnd) {
 
 static void set_busy(bool busy) {
     for (HWND h : { g_start, g_input_browse, g_output_browse, g_input, g_output,
-                    g_translate, g_center, g_dump, g_debug, g_multipass,
+                    g_translate, g_center, g_dump, g_debug, g_backend,
                     g_model, g_lang, g_vmodel })
         EnableWindow(h, !busy);
 }

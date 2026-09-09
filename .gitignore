@@ -14,6 +14,16 @@
 # ONNX Runtime (DirectML) - provided locally, not committed (large binaries)
 /third_party/onnxruntime/
 
+# Prebuilt whisper backend-DL DLL set - mirrored locally / fetched in CI (large),
+# produced by scripts/build-whisper-dlls.ps1; not committed.
+/third_party/whisper/
+
+# whisper deps-build tree (CUDA/Vulkan compile output, multi-GB)
+/build-whisper-dlls/
+
+# Python bytecode cache
+__pycache__/
+
 # Editor / OS cruft
 .vscode/
 .idea/

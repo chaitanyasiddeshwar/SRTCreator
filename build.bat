@@ -1,6 +1,9 @@
 @echo off
-rem Builds srt.exe: whisper.cpp (CUDA) + minimized FFmpeg audio path.
-rem Discovers MSVC like Axiom (vswhere -> VsDevCmd), then drives CMake.
+rem Builds srt.exe / srtgui.exe: thin orchestration over PREBUILT whisper/ggml,
+rem FFmpeg and ONNX DLLs. MSVC-ONLY - no CUDA Toolkit, no nvcc, no Vulkan SDK.
+rem The whisper backend DLLs are produced once by scripts\build-whisper-dlls.ps1
+rem (that step needs the CUDA Toolkit + Vulkan SDK; this app build does not).
+rem Discovers MSVC (vswhere -> VsDevCmd), then drives CMake.
 rem
 rem   build.bat            configure + build (Release)
 rem   build.bat clean      wipe build\ and rebuild from scratch
@@ -26,34 +29,23 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem Ninja (bundled with VS's CMake component) drives nvcc directly, avoiding the
-rem "No CUDA toolset found" failure of the Visual Studio generator when CUDA's
-rem MSBuild integration isn't installed into VS.
+rem Ninja (bundled with VS's CMake component). CUDA_PATH, if set (machine env),
+rem only lets CMake stage the CUDA runtime DLLs next to the exe - nvcc is NOT used.
 set "NINJADIR=%VSPATH%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
 if exist "%NINJADIR%\ninja.exe" set "PATH=%NINJADIR%;%PATH%"
 
-rem --- CUDA toolkit ---
-if not defined CUDA_PATH set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0"
-if not exist "%CUDA_PATH%\bin\nvcc.exe" (
-    echo [build] nvcc not found at %CUDA_PATH%. Set CUDA_PATH to your CUDA Toolkit.
+rem --- Prebuilt whisper/ggml backend DLLs must be present (scripts\build-whisper-dlls.ps1) ---
+if not exist "%~dp0third_party\whisper\include\whisper.h" (
+    echo [build] Missing prebuilt whisper at third_party\whisper\ ^(need include\, lib\, bin\^).
+    echo [build] Run scripts\build-whisper-dlls.ps1 ^(needs CUDA Toolkit + Vulkan SDK^).
     exit /b 1
 )
-echo [build] CUDA: %CUDA_PATH%
 
 rem --- FFmpeg dev libs must be provided (see README) ---
 if not exist "%~dp0third_party\ffmpeg\include" (
     echo [build] Missing FFmpeg dev libs at third_party\ffmpeg\ ^(need include\, lib\, bin\^).
     echo [build] See README.md / CLAUDE.md section 4.
     exit /b 1
-)
-
-rem --- Apply whisper.cpp patches if needed ---
-if exist "%~dp0patches\whisper.patch" (
-    git -C "%~dp0third_party\whisper.cpp" apply --check "%~dp0patches\whisper.patch" >nul 2>&1
-    if not errorlevel 1 (
-        echo [build] Applying patches\whisper.patch to third_party\whisper.cpp...
-        git -C "%~dp0third_party\whisper.cpp" apply "%~dp0patches\whisper.patch"
-    )
 )
 
 rem --- clean ---

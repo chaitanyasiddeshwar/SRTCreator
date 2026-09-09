@@ -10,6 +10,29 @@ it.
 
 ---
 
+> **STATUS — modular refactor landed (branch `module_refactor`, 2026-09-09).**
+> Several sections below describe the SUPERSEDED design. What changed (see
+> `modular_proposal.md` §11–12 and `README.md` for the current state):
+> - **whisper/ggml are consumed as prebuilt `GGML_BACKEND_DL` DLLs**, not compiled
+>   into the exe. The app build is **MSVC-only** (no CUDA/nvcc/Vulkan). The exes are
+>   ~0.6 MB (was 67 MB). `scripts/build-whisper-dlls.ps1` produces the coherent
+>   CPU+CUDA+Vulkan DLL set (build machine / CI only); `CMakeLists.txt` consumes
+>   `third_party/whisper/{include,lib,bin}` like FFmpeg — no `add_subdirectory`.
+> - **Runtime backend selection** (`ggml_backend_load_all` in `transcribe.cpp`):
+>   CUDA → Vulkan → CPU, auto-detected; falls back to CPU with no GPU.
+> - **The multi-pass / timeline pipeline is REMOVED** (`src/timeline.*` deleted, all
+>   Pass 2/2.5/3 code + `--multipass`/`--no-infill`/`--pause-split`/`--timeline-json`
+>   flags gone). **Segment mode is the sole pipeline.** So §3.1, §14 (DTW/patch) and
+>   §15 (multi-pass) below are historical. `patches/whisper.patch` was dropped (stock
+>   whisper; segment mode never exercises the patched VAD-remapping path).
+> - **Tiered distribution**: universal CPU **base** zip + additive **CUDA**/**Vulkan**
+>   GPU packs (`scripts/package.ps1`); pinned deps in `dependencies.json`,
+>   `scripts/fetch-deps.ps1`, CI in `.github/workflows/release.yml`.
+> Treat §4 (build), §6 (distribution), §2 (stack) as needing a full rewrite; the
+> facts above take precedence where they conflict.
+
+---
+
 ## 1. Goal & constraints
 
 - **Fastest and lightest** possible. Single native `srt.exe` (C++), no Python,

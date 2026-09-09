@@ -1,0 +1,145 @@
+# SRTCreator CI / release (modular_proposal.md §12).
+#
+# Three jobs mirror the split build:
+#   whisper-dlls  heavy, cached by submodule SHA - builds the coherent backend-DL
+#                 DLL set (CPU+CUDA+Vulkan) with the CUDA Toolkit + Vulkan SDK.
+#   app           fast, MSVC-only - fetches FFmpeg/ONNX, consumes the whisper DLLs,
+#                 builds srt.exe/srtgui.exe, assembles the tiered zips.
+#   release       on a version tag - publishes the zips + notices as a GitHub Release.
+#
+# HARD LIMITATION (§12.3): GitHub-hosted runners have NO GPU, so CI compiles and
+# packages the CUDA/Vulkan DLLs but cannot functionally test them on a GPU. The
+# app job runs a CPU-only smoke test; GPU validation (the Phase-2a Vulkan gate,
+# CUDA correctness) is a manual sign-off or a self-hosted GPU runner before publish.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}   # manual runs (builds + packages, no publish)
+
+env:
+  CUDA_VERSION: "13.0.0"
+  VULKAN_SDK_VERSION: "1.4.357.0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  whisper-dlls:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Cache the staged DLL set by the whisper submodule SHA + the build flags.
+      # A cache hit skips the 20-40 min CUDA-kernel compile entirely.
+      - name: Cache whisper DLLs
+        id: cache-whisper
+        uses: actions/cache@v4
+        with:
+          path: third_party/whisper
+          key: whisper-dlls-${{ hashFiles('.gitmodules') }}-${{ hashFiles('third_party/whisper.cpp/CMakeLists.txt') }}-cuda${{ env.CUDA_VERSION }}-vk${{ env.VULKAN_SDK_VERSION }}-v1
+
+      - name: Resolve whisper submodule SHA
+        if: steps.cache-whisper.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: git -C third_party/whisper.cpp rev-parse HEAD
+
+      - name: Install CUDA Toolkit
+        if: steps.cache-whisper.outputs.cache-hit != 'true'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev","nvrtc","nvrtc_dev","visual_studio_integration"]'
+
+      - name: Install Vulkan SDK
+        if: steps.cache-whisper.outputs.cache-hit != 'true'
+        uses: humbletim/install-vulkan-sdk@v1.1.1
+        with:
+          version: ${{ env.VULKAN_SDK_VERSION }}
+          cache: true
+
+      - name: Build whisper backend DLLs
+        if: steps.cache-whisper.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $env:CUDA_PATH = $env:CUDA_PATH  # set by the toolkit action
+          ./scripts/build-whisper-dlls.ps1 -Jobs 4
+
+      - name: Upload whisper DLLs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-dlls
+          path: third_party/whisper
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  app:
+    needs: whisper-dlls
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch FFmpeg + ONNX/DirectML (pinned)
+        shell: pwsh
+        run: ./scripts/fetch-deps.ps1
+
+      - name: Download whisper DLLs
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-dlls
+          path: third_party/whisper
+
+      - name: Build (MSVC only)
+        shell: cmd
+        run: build.bat
+
+      - name: CPU smoke test (no GPU on hosted runners)
+        shell: pwsh
+        run: |
+          # A hosted runner has no GPU, so this exercises the CPU backend / DLL
+          # loading path only. GPU correctness is a separate manual/self-hosted gate.
+          ./build/srt.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "srt.exe --help failed" }
+
+      - name: Package tiered zips
+        shell: pwsh
+        run: ./scripts/package.ps1
+
+      - name: Upload distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*.zip
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: app
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - name: Download distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+          body: |
+            SRTCreator ${{ github.ref_name }}
+
+            - **base** zip: universal win64 (CPU transcription + DirectML vocal isolation).
+            - **cuda-pack**: NVIDIA power pack - unzip next to the exe (driver only).
+            - **vulkan-pack**: any modern GPU - unzip next to the exe (driver only).
+
+            > GPU backends are compiled + packaged by CI but validated on GPU
+            > hardware via a separate manual/self-hosted gate (hosted runners have
+            > no GPU). See dependencies.json for pinned component versions.

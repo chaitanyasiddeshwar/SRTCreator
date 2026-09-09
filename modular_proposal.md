@@ -257,44 +257,118 @@ Either way, the *project's* build is CUDA-free and toolkit-free; whisper DLLs ar
 
 ---
 
-## 11. Decisions (locked 2026-09-09)
+## 11. Decisions (locked 2026-09-09) — Path A, split build
 
-- **GPU strategy: Option B — Vulkan + CPU. Drop CUDA entirely.** One small universal GPU
-  pack (`ggml-vulkan.dll`, driver-only, any modern GPU) over a CPU base. Accept the ~10%
-  speed cost vs CUDA for a few-MB, vendor-neutral GPU story and no ~500 MB CUDA pack.
-- **Remove the multi-pass pipeline AND drop `patches/whisper.patch`.** Go prebuilt-only;
-  delete `timeline.{h,cpp}` (~1,065 lines) and the legacy Pass 2/3 code paths, flags, and UI.
+- **GPU strategy: keep CUDA (proven, default) + Vulkan (validated fallback) + CPU, all as
+  `GGML_BACKEND_DL` plugin DLLs at ONE ggml version, built from the pinned submodule.**
+  Runtime auto-selects the best available (CUDA → Vulkan → CPU); the GUI shows a radio button
+  per *detected* backend. CUDA moves from static-in-exe to `ggml-cuda.dll` (still prebuilt &
+  proven — just a plugin). Building from one submodule commit guarantees ABI coherence, which
+  mixing prebuilt zips from different tags does NOT (confirmed: whisper-b4938 vs llama-b10872
+  ship different-sized `ggml-base.dll` → won't safely co-load).
+- **Remove the multi-pass pipeline AND drop `patches/whisper.patch`.** Delete
+  `timeline.{h,cpp}` (~1,065 lines) and the legacy Pass 2/3 code paths, flags, and UI.
   Segment mode is the sole pipeline; it needs neither the patch nor whisper's internal VAD.
 
-### Blockers for the dependency swap (just downloads — no SDK required)
-- **Vulkan SDK is NOT required.** Running Vulkan needs only the driver's `vulkan-1.dll`
-  runtime; `ggml-vulkan.dll` ships shaders precompiled to SPIR-V. The SDK is only for
-  *building* the backend from source — which we avoid by reusing a **prebuilt
-  `ggml-vulkan.dll` from llama.cpp** (`llama-bNNNNN-bin-win-vulkan-x64.zip`). ggml is shared
-  between whisper.cpp and llama.cpp and both use `GGML_BACKEND_DL`, so the Vulkan backend is
-  a drop-in — **provided the ggml version/ABI matches** the whisper DLLs. Pin a whisper.cpp
-  release and a llama.cpp build on the same/compatible ggml commit and verify with a drop-in
-  test. SDK build (`-DGGML_VULKAN=ON`, LunarG SDK) is the fallback only if they won't load
-  together.
-- **Fetch two prebuilt zips** (both just downloads; the agent session can't reach the GitHub
-  release CDN, so the user grabs them, mirrored into `third_party/whisper/` like FFmpeg):
-  `whisper-bin-x64.zip` (CPU base: `whisper.dll`, `ggml*.dll`) and the matching
-  `ggml-vulkan.dll` from the llama.cpp Vulkan zip.
+### Split into two builds (the structural key)
+Do NOT keep `add_subdirectory(whisper)` in the app build. Two independent builds:
 
-### Revised execution order
+1. **Deps build (rare — only on a whisper version bump):** `scripts/build-whisper-dlls.ps1`
+   compiles the vendored submodule with
+   `-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON
+   -DGGML_VULKAN=ON` and stages the coherent DLL set + import lib + headers into
+   `third_party/whisper/{bin,lib,include}`. **Needs CUDA Toolkit + Vulkan SDK — build machine
+   / CI only.**
+2. **App build (common):** MSVC-only. `CMakeLists.txt` consumes `third_party/whisper` exactly
+   like FFmpeg (import lib + headers), no `add_subdirectory`, **no CUDA/nvcc/Vulkan needed**.
+   Exe drops from 67 MB to ~2 MB. Contributors hacking on orchestration need only MSVC.
+
+Result: reproducible from git (one pinned submodule commit → the whole coherent DLL set),
+proven CUDA retained, Vulkan + CPU added, all runtime-selectable, thin app build.
+
+### Build-machine requirements (users need NONE of these)
+- **CUDA Toolkit** (have it — 13.0) for `ggml-cuda.dll`.
+- **Vulkan SDK** (one-time LunarG install; `glslc`/`vulkan-shaders-gen`) for `ggml-vulkan.dll`.
+  End users need only their GPU driver (`vulkan-1.dll` ships with it).
+
+### Execution order
 1. **Phase 1 — Remove multi-pass (buildable now, no new deps).** Delete `timeline.{h,cpp}`;
    strip the Pass 2/3 blocks, `--multipass`/`--legacy`/`--no-infill`/`--pause-split`/
-   `--timeline-json` flags, the GUI "Multi-pass mode" checkbox, and the timeline-summary
-   code from `main.cpp`/`main_gui.cpp`. Segment mode becomes the only path. Still builds
-   whisper from source for now.
-2. **Phase 2 — Dependency swap (needs prebuilt whisper CPU DLLs + a matching
-   `ggml-vulkan.dll` from llama.cpp; no SDK).** Replace
-   `add_subdirectory(third_party/whisper.cpp)` + all `GGML_*`/CUDA settings with a
-   `third_party/whisper/{include,lib,bin}` block (import lib + headers + CPU DLLs); build
-   `ggml-vulkan.dll` once; wire `ggml_backend_load_all()` + device reporting in
-   `transcribe.cpp`; remove the submodule + patch + `build.bat` CUDA discovery.
-3. **Phase 3 — Productise.** First-run backend/driver detection, optional Vulkan-pack +
-   model downloader, tiered zips, README/ARCHITECTURE rewrite.
+   `--timeline-json` flags, the GUI "Multi-pass mode" checkbox, and the timeline-summary code.
+   Segment mode becomes the only path. Still builds whisper from source (unchanged CMake).
+2. **Phase 2a — Vulkan smoke test (MILESTONE 1, gates the whole GPU plan).** Build the
+   coherent DLL set once (`build-whisper-dlls.ps1`), run one Tron transcription on **Vulkan**,
+   confirm output matches CUDA/CPU and it's genuinely GPU-fast (no silent per-op CPU
+   fallback). Commit to Vulkan on evidence, not assumption.
+3. **Phase 2b — Split-build swap.** Add the `third_party/whisper` consumption block; remove
+   `add_subdirectory` + all `GGML_*`/CUDA settings from `CMakeLists.txt`; wire
+   `ggml_backend_load_all()` + generic device enumeration/reporting in `transcribe.cpp`; make
+   the GUI backend selector **data-driven** (radio per detected device, not hardcoded);
+   retire the submodule-in-app-build + patch + `build.bat` CUDA discovery.
+4. **Phase 3 — Productise + CI (see §12).** First-run backend/driver detection, tiered zips,
+   GitHub Actions release, licenses, README/ARCHITECTURE rewrite.
+
+---
+
+## 12. Official releasable bundle via GitHub Actions
+
+The split-build maps almost 1:1 onto CI, but going "officially releasable" forces a few
+concrete changes to how the repo is set up today.
+
+### 12.1 What CI needs that we don't have yet
+- **All deps must be *fetchable by pinned version* — today they're "provided locally,
+  git-ignored".** FFmpeg (`third_party/ffmpeg`), ONNX Runtime + DirectML
+  (`third_party/onnxruntime`) and the built whisper DLLs are local. A clean CI checkout has
+  none of them. So we must add **`scripts/fetch-deps.ps1`** that downloads *pinned* FFmpeg
+  (BtbN LGPL shared) and ONNX-Runtime-DirectML by exact version/URL, plus a pinned models
+  step if we ever bundle them. This is the single biggest prerequisite change.
+- **A version/manifest file** recording pinned versions of every dependency + the whisper
+  submodule SHA + each backend DLL, surfaced in `--version` / GUI About and the release notes.
+
+### 12.2 The workflow shape (mirrors whisper.cpp's own `release.yml`)
+- **Job `whisper-dlls` (`windows-2022`, heavy, cached):** checkout with submodules; install
+  **CUDA Toolkit** (via NVIDIA redist archives, exactly as whisper.cpp's release CI does) and
+  the **Vulkan SDK**; run `build-whisper-dlls.ps1`; upload the DLL set as an artifact. **Cache
+  keyed by the whisper submodule SHA + flags**, so it only rebuilds on a version bump (CUDA
+  kernel compile is 20–40 min).
+- **Job `app` (`windows-2022`, fast, MSVC-only):** `fetch-deps.ps1`; download the
+  `whisper-dlls` artifact; build `srt.exe` / `srtgui.exe`; assemble bundles.
+- **Job `release` (on tag push):** zip the tiered packages, create a GitHub Release, upload
+  assets, attach `LICENSES/` and the manifest.
+
+### 12.3 The hard limitation: GitHub-hosted runners have NO GPU
+CI can **compile and package** CUDA/Vulkan DLLs, but it **cannot functionally test them on a
+GPU**. So:
+- CPU-path smoke tests (decode → segment transcribe → SRT) run on hosted runners.
+- **GPU validation (the Phase-2a Vulkan smoke test, CUDA correctness) needs a self-hosted
+  runner with a GPU** — e.g. register the 3080 Ti machine as a self-hosted runner — or a
+  documented manual gate before publishing a release. This is a real constraint to plan for,
+  not a blocker.
+
+### 12.4 Licensing for public distribution (stricter than personal use)
+- Ship a **`LICENSES/`** dir: MIT (whisper/ggml, ONNX Runtime), **LGPL-2.1+ FFmpeg** with the
+  relink offer/notice (dynamic DLLs satisfy it, but the notice is required), NVIDIA CUDA EULA
+  (if a CUDA pack is shipped), DirectML redistributable terms.
+- Keep **models downloaded on first run** (not bundled) to avoid shipping model weights.
+
+### 12.5 Other "official" polish (optional, flag for decision)
+- **Code signing (Authenticode):** unsigned exes trigger SmartScreen. A signing cert (cost +
+  a CI secret) removes the warning. Optional but expected of a real release.
+- **Version resource** embedded in the exes; semantic-version tags drive releases.
+- **Tiered packaging** decision (§7 Q6): one fat installer vs a small base + on-demand GPU
+  pack / model downloader.
+
+### 12.6 How CI changes what we build (net)
+It mostly *validates* the split-build, but it adds these must-dos to the plan:
+1. `scripts/fetch-deps.ps1` (pinned FFmpeg + ONNX/DirectML) — required for any clean build.
+2. `scripts/build-whisper-dlls.ps1` must be **fully scriptable / parameterized** (flags,
+   output dir) and self-contained (submodule + toolkit installs) so a runner can drive it.
+3. A **dependency manifest** (pinned versions) committed to the repo.
+4. A **GPU test gate** via self-hosted runner or manual sign-off before publishing.
+5. `LICENSES/` + release notes generation.
+
+None of these change the *architecture* — they harden it into something reproducible on a
+clean machine, which is exactly what "officially releasable" means.
 
 ---
 

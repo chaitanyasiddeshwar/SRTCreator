@@ -1,0 +1,47 @@
+{
+  "_comment": "Pinned dependency manifest for reproducible builds (modular_proposal.md 12.1). Surfaced in --version / GUI About and release notes; consumed by scripts/fetch-deps.ps1 and scripts/build-whisper-dlls.ps1. Bump here when a dependency is updated.",
+  "app": {
+    "name": "SRTCreator",
+    "version": "0.2.0"
+  },
+  "whisper": {
+    "_role": "ASR engine, built to backend-DL DLLs by scripts/build-whisper-dlls.ps1",
+    "submodule_sha": "52a939a2a762224e255d366c1182b2af4dd1a032",
+    "whisper_cpp_version": "1.9.3-dev",
+    "ggml_version": "0.23.0",
+    "ggml_commit": "52a939a2",
+    "backends": ["cpu-all-variants", "cuda", "vulkan"],
+    "cuda_arch": "86"
+  },
+  "cuda": {
+    "_role": "CUDA runtime shipped in the NVIDIA GPU pack (cudart/cublas/cublasLt); users need only an NVIDIA driver",
+    "toolkit_version": "13.0"
+  },
+  "vulkan": {
+    "_role": "GPU pack backend; end users need only their GPU driver's vulkan-1.dll. SDK is build-machine only.",
+    "sdk_version": "1.4.357.0"
+  },
+  "ffmpeg": {
+    "_role": "demux/decode any container -> PCM (audio path only). BtbN LGPL shared.",
+    "version": "n9.0.1",
+    "build_id": "n9.0.1-26-g5c8e7e2433-20260906",
+    "license": "LGPL-2.1+",
+    "source": "https://github.com/BtbN/FFmpeg-Builds/releases",
+    "asset": "ffmpeg-master-latest-win64-lgpl-shared.zip",
+    "sonames": ["avformat-63", "avcodec-63", "avutil-61", "swresample-7"]
+  },
+  "onnxruntime": {
+    "_role": "MDX-Net vocal isolation via the DirectML execution provider (any DX12 GPU)",
+    "version": "1.24",
+    "ort_api_version": 24,
+    "execution_provider": "DirectML",
+    "license": "MIT",
+    "source": "https://github.com/microsoft/onnxruntime/releases",
+    "asset": "Microsoft.ML.OnnxRuntime.DirectML.1.24.0.nupkg"
+  },
+  "directml": {
+    "_role": "DirectML runtime paired with the ONNX Runtime DirectML EP",
+    "version": "1.15.4",
+    "license": "Microsoft redistributable"
+  }
+}
