@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <string>
@@ -25,6 +26,7 @@
 #include "log.h"
 #include "debug.h"
 #include "timeline.h"
+#include "segment_mode.h"
 
 static std::wstring format_duration_hms_w(double seconds) {
     if (seconds < 0.0) seconds = 0.0;
@@ -62,16 +64,17 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define WM_APP_DONE     (WM_APP + 5) // lParam = wchar_t* ; wParam = success
 
 enum {
-    ID_TRANSLATE = 1001, ID_FLASH, ID_WORDTS, ID_WRAP, ID_CENTER, ID_INFILL, ID_DUMP, ID_DEBUG,
+    ID_TRANSLATE = 1001, ID_CENTER, ID_DUMP, ID_DEBUG, ID_MULTIPASS,
     ID_MODEL, ID_LANG, ID_VMODEL, ID_EDIT, ID_PROGRESS, ID_STATUS,
     ID_INPUT, ID_INPUT_BROWSE, ID_OUTPUT, ID_OUTPUT_BROWSE, ID_START
 };
 
 static HWND g_status;
 static HWND g_input_lbl, g_input, g_input_browse, g_output_lbl, g_output, g_output_browse;
-static HWND g_translate, g_flash, g_wordts, g_wrap, g_center, g_infill, g_dump, g_debug;
+static HWND g_translate, g_center, g_dump, g_debug, g_multipass;
 static HWND g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel, g_start;
 static HWND g_edit, g_progress;
+static HWND g_tip = nullptr; // shared tooltip control for the checkboxes
 static std::atomic<bool> g_running{false};
 
 static std::wstring to_wide(const std::string& s) {
@@ -119,7 +122,7 @@ struct Job {
     HWND hwnd;
     std::wstring input, output;
     std::string model, language, vocal_model;
-    bool translate, flash, word_ts, center, infill, dump_audio, debug;
+    bool translate, flash, word_ts, center, infill, dump_audio, debug, segmode;
     int max_line_length;
 };
 
@@ -189,6 +192,40 @@ static void do_job(Job job) {
         }
     } cleanup{pcm, mix, vocals, segments, vad_regions, tl_map};
 
+    // Cache: reuse a 16k mono whisper input sitting next to the movie (a prior run's
+    // dump, or the CLI's) to skip decode + isolation entirely - mirrors main.cpp
+    // (see §14). Prefer the isolated vocal stem. This is what the GUI was missing.
+    std::string cached_wav;
+    {
+        size_t cdot = input.find_last_of('.');
+        std::string cbase = (cdot == std::string::npos) ? input : input.substr(0, cdot);
+        for (const char* suf : { ".vocals16k.wav", ".whisper16k.wav" }) {
+            std::string cand = cbase + suf;
+            FILE* cf = std::fopen(cand.c_str(), "rb");
+            if (cf) { std::fclose(cf); cached_wav = cand; break; }
+        }
+    }
+
+    if (!cached_wav.empty()) {
+        post_str(hwnd, WM_APP_STATUS, 0, L"Using cached audio (skipping decode + isolation)…");
+        post_str(hwnd, WM_APP_SEGMENT, 0, L"[cache] using " + to_wide(cached_wav) + L"\r\n");
+        logging::logf("INFO", "using cached whisper input %s (skip decode/isolation)", cached_wav.c_str());
+        auto t_c0 = std::chrono::steady_clock::now();
+        audio::DecodeOptions dc;
+        dc.sample_rate = 16000; dc.channels = 1; dc.center_channel_only = false;
+        dc.on_progress = prog;
+        if (!audio::decode(cached_wav, dc, pcm, err)) {
+            logging::error("cached audio load failed: " + err);
+            post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err)); return;
+        }
+        dur_phase1 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_c0).count();
+        logging::logf("INFO", "Phase 1 (Cached audio load) completed in %s (%.2fs)",
+                      format_duration_hms(dur_phase1).c_str(), dur_phase1);
+        post_str(hwnd, WM_APP_SEGMENT, 0,
+                 L"[timing] Phase 1 (Cached audio load): " + format_duration_hms_w(dur_phase1) + L"\r\n");
+        post_str(hwnd, WM_APP_SEGMENT, 0,
+                 L"[cache] audio ready: " + std::to_wstring((int)(pcm.size() / 16000.0 / 60.0)) + L" min\r\n");
+    } else {
     post_str(hwnd, WM_APP_STATUS, 0, L"Decoding (44.1k stereo for separation)…");
     audio::DecodeOptions d;
     d.sample_rate = 44100; d.channels = 2; d.center_channel_only = job.center;
@@ -232,6 +269,7 @@ static void do_job(Job job) {
     post_str(hwnd, WM_APP_SEGMENT, 0,
              L"[timing] Phase 2 (Voice isolation): " + format_duration_hms_w(dur_phase2) + L"\r\n");
     logging::logf("INFO", "isolated audio ready %.1f min", pcm.size() / 16000.0 / 60.0);
+    } // end else (no cache): decode + isolation
 
     // Dump the exact 16 kHz mono track fed to whisper, next to the input - ONLY
     // when the Dump audio box is checked.
@@ -278,7 +316,30 @@ static void do_job(Job job) {
         post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
         return;
     }
-    if (!session.transcribe(pcm, t, segments, err)) {
+    if (job.segmode) {
+        // EXPERIMENTAL: VAD-segmented per-region transcription (see segment_mode.*).
+        // Leaves vad_regions empty so the Pass 2/3 block below is skipped. Progress
+        // and live cues are driven by segment_mode's region-level callbacks (the same
+        // progress bar / transcript panel the default path uses).
+        post_str(hwnd, WM_APP_STATUS, 0, L"Transcribing (segment mode)…");
+        post_str(hwnd, WM_APP_SEGMENT, 0, L"[segment] VAD-segmented per-region transcription\r\n");
+        segment_mode::Options sopts;
+        sopts.vad_model_path = vad_path;
+        if (!segment_mode::run(pcm, session, t, sopts, segments, err,
+                [hwnd](const std::string& msg){ post_str(hwnd, WM_APP_SEGMENT, 0, L"[segment] " + to_wide(msg) + L"\r\n"); },
+                [hwnd](int pct){ PostMessageW(hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0); },
+                [hwnd, &live_dedup](const srt::Segment& s){
+                    if (live_dedup.is_duplicate(s.text)) return;
+                    std::wstring line = L"[" + to_wide(srt::format_timestamp(s.t0)).substr(0, 8) + L"]  "
+                                      + to_wide(s.text) + L"\r\n";
+                    post_str(hwnd, WM_APP_SEGMENT, 0, line);
+                })) {
+            logging::error("segment-mode failed: " + err);
+            session.close();
+            post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
+            return;
+        }
+    } else if (!session.transcribe(pcm, t, segments, err)) {
         logging::error("transcribe failed: " + err);
         session.close();
         post_str(hwnd, WM_APP_DONE, 0, L"Error: " + to_wide(err));
@@ -300,7 +361,7 @@ static void do_job(Job job) {
     size_t dot_pos = out_utf8.find_last_of('.');
     std::string json_path = (dot_pos == std::string::npos ? out_utf8 : out_utf8.substr(0, dot_pos)) + ".timeline.json";
 
-    if (!vad_regions.empty()) {
+    if (!job.segmode && !vad_regions.empty()) {
         post_str(hwnd, WM_APP_STATUS, 0, L"Pass 2: Sanitizing cues against timeline…");
         auto t_p4_start = std::chrono::steady_clock::now();
         tl_map = timeline::build_timeline(input, pcm, vad_regions);
@@ -468,13 +529,15 @@ static void start_job(HWND hwnd) {
     job.language    = to_utf8(get_text(g_lang));
     job.vocal_model = to_utf8(get_text(g_vmodel));
     job.translate   = checked(g_translate);
-    job.flash       = checked(g_flash);
-    job.word_ts     = checked(g_wordts);
+    job.flash       = true;   // always on
+    job.word_ts     = true;   // always on (DTW word timing)
     job.center      = checked(g_center);
-    job.infill      = checked(g_infill);
+    job.infill      = true;   // always on; effective in multi-pass mode only
     job.dump_audio  = checked(g_dump);
     job.debug       = checked(g_debug);
-    job.max_line_length = checked(g_wrap) ? 42 : 0;
+    // Segment mode is the default; the checkbox opts INTO the legacy multi-pass pipeline.
+    job.segmode     = !checked(g_multipass);
+    job.max_line_length = 42; // line wrapping always on
     set_busy(true);
     std::thread(run_job, job).detach();
 }
@@ -519,19 +582,19 @@ static void layout(HWND hwnd) {
     MoveWindow(g_output, m + lw, y, W - 2 * m - lw - bw - 6, 24, TRUE);
     MoveWindow(g_output_browse, W - m - bw, y, bw, 24, TRUE); y += 32;
 
-    // Checkbox row 1: transcription options.
+    // Checkbox row 1: pipeline options.
     int x = m;
     struct { HWND h; int w; } r1[] = {
-        {g_translate, 175}, {g_flash, 145}, {g_wordts, 160}, {g_wrap, 145}
+        {g_translate, 170}, {g_center, 210}, {g_multipass, 210}
     };
-    for (auto& c : r1) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 12; }
+    for (auto& c : r1) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 16; }
     y += 28;
-    // Checkbox row 2: dialogue-audio and pipeline options.
+    // Checkbox row 2: debug options.
     x = m;
     struct { HWND h; int w; } r2[] = {
-        {g_center, 195}, {g_infill, 170}, {g_dump, 150}, {g_debug, 120}
+        {g_dump, 175}, {g_debug, 150}
     };
-    for (auto& c : r2) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 10; }
+    for (auto& c : r2) { MoveWindow(c.h, x, y, c.w, 24, TRUE); x += c.w + 16; }
     y += 32;
 
     // Model / language / vocal-model / Start.
@@ -554,6 +617,35 @@ static void layout(HWND hwnd) {
     MoveWindow(g_progress, m, H - m - prog_h, W - 2 * m, prog_h, TRUE);
 }
 
+// Register a hover tooltip for a control. TTF_SUBCLASS lets the tooltip control
+// handle the hover/hide itself, so it appears on hover and auto-hides after a delay.
+static void add_tip(HWND parent, HWND ctrl, const wchar_t* text) {
+    if (!g_tip || !ctrl) return;
+    TOOLINFOW ti = {};
+    ti.cbSize   = sizeof(ti);
+    ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd     = parent;
+    ti.uId      = (UINT_PTR)ctrl;
+    ti.lpszText = const_cast<wchar_t*>(text);
+    SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+static void create_tooltips(HWND hwnd) {
+    g_tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                            hwnd, nullptr,
+                            (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE), nullptr);
+    if (!g_tip) return;
+    SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, 380);            // enable multi-line wrapping
+    SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, (LPARAM)15000); // keep visible ~15s to read
+    add_tip(hwnd, g_translate, L"Translate speech to English instead of transcribing in the original language.");
+    add_tip(hwnd, g_center,    L"Extract only the front-center channel (where dialogue sits in 5.1/7.1 mixes) before vocal isolation. Turn off to isolate from the full stereo downmix.");
+    add_tip(hwnd, g_dump,      L"Write the exact 16 kHz mono audio fed to Whisper next to the input (<stem>.vocals16k.wav), for debugging.");
+    add_tip(hwnd, g_debug,     L"Write a detailed timing/diagnostics report next to the output SRT.");
+    add_tip(hwnd, g_multipass, L"Use the legacy multi-pass timeline pipeline: transcribe the whole track at once, then sanitize timing and infill gaps. Leave unchecked for the default segment mode, which transcribes each detected speech region in isolation for tighter timing.");
+}
+
 static HWND mk(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
     return CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0,
                            parent, (HMENU)(INT_PTR)id,
@@ -570,19 +662,18 @@ static void create_controls(HWND hwnd) {
     g_output       = mk(hwnd, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER, ID_OUTPUT);
     g_output_browse= mk(hwnd, L"BUTTON", L"Browse…", BS_PUSHBUTTON, ID_OUTPUT_BROWSE);
 
+    // Only user-meaningful toggles are exposed. Flash attention, DTW word timestamps,
+    // line wrapping (42) and Pass 3 infill are always on (infill applies in multi-pass
+    // mode only) and are set unconditionally in the job, not shown as checkboxes.
     g_translate = mk(hwnd, L"BUTTON", L"Translate → English",       BS_AUTOCHECKBOX, ID_TRANSLATE);
-    g_flash     = mk(hwnd, L"BUTTON", L"Flash attention",           BS_AUTOCHECKBOX, ID_FLASH);
-    g_wordts    = mk(hwnd, L"BUTTON", L"Word timestamps",           BS_AUTOCHECKBOX, ID_WORDTS);
-    g_wrap      = mk(hwnd, L"BUTTON", L"Wrap lines (42)",           BS_AUTOCHECKBOX, ID_WRAP);
     g_center    = mk(hwnd, L"BUTTON", L"Center channel (dialogue)", BS_AUTOCHECKBOX, ID_CENTER);
-    g_infill    = mk(hwnd, L"BUTTON", L"Infill speech (Pass 3)",    BS_AUTOCHECKBOX, ID_INFILL);
     g_dump      = mk(hwnd, L"BUTTON", L"Dump audio (debug)",        BS_AUTOCHECKBOX, ID_DUMP);
     g_debug     = mk(hwnd, L"BUTTON", L"Debug report",              BS_AUTOCHECKBOX, ID_DEBUG);
-    SendMessageW(g_flash,  BM_SETCHECK, BST_CHECKED, 0);
-    SendMessageW(g_wrap,   BM_SETCHECK, BST_CHECKED, 0);
-    SendMessageW(g_center, BM_SETCHECK, BST_CHECKED, 0);
-    SendMessageW(g_wordts, BM_SETCHECK, BST_CHECKED, 0); // DTW word timing: tighter cue sync
-    SendMessageW(g_infill, BM_SETCHECK, BST_CHECKED, 0); // Pass 3 infill enabled by default
+    g_multipass = mk(hwnd, L"BUTTON", L"Multi-pass mode (legacy)",  BS_AUTOCHECKBOX, ID_MULTIPASS);
+    // Center channel OFF by default (user preference): isolate from the full stereo
+    // downmix. Tick it to extract only the Front-Center channel first. The baseline
+    // harness scores center-on slightly higher, but center-off captures more side
+    // dialogue. Matches the CLI default (main.cpp `center=false`).
 
     g_model_lbl = mk(hwnd, L"STATIC", L"Model:", SS_LEFT, 0);
     g_model = mk(hwnd, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_MODEL);
@@ -615,15 +706,17 @@ static void create_controls(HWND hwnd) {
 
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     for (HWND h : { g_status, g_input_lbl, g_input, g_input_browse, g_output_lbl, g_output,
-                    g_output_browse, g_translate, g_flash, g_wordts, g_wrap, g_center,
-                    g_infill, g_dump, g_debug, g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel,
+                    g_output_browse, g_translate, g_center, g_dump, g_debug, g_multipass,
+                    g_model_lbl, g_model, g_lang_lbl, g_lang, g_vmodel_lbl, g_vmodel,
                     g_start, g_edit })
         SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
+
+    create_tooltips(hwnd); // hover help for every checkbox
 }
 
 static void set_busy(bool busy) {
     for (HWND h : { g_start, g_input_browse, g_output_browse, g_input, g_output,
-                    g_translate, g_flash, g_wordts, g_wrap, g_center, g_infill, g_dump, g_debug,
+                    g_translate, g_center, g_dump, g_debug, g_multipass,
                     g_model, g_lang, g_vmodel })
         EnableWindow(h, !busy);
 }

@@ -16,6 +16,7 @@
 #include "log.h"
 #include "debug.h"
 #include "timeline.h"
+#include "segment_mode.h"
 
 namespace {
 
@@ -47,9 +48,13 @@ void usage() {
         "      --audio-stream <n>   Audio stream index (default: best)\n"
         "      --duration <sec>     Only transcribe the first <sec> seconds\n"
         "      --no-flash-attn      Disable flash attention (on by default)\n"
-        "      --no-center          Don't isolate the center channel (dialogue)\n"
+        "      --center             Extract only the Front-Center channel (dialogue) before\n"
+        "                           isolation (default OFF: isolate from full stereo downmix)\n"
         "      --vocal-model <name> Vocal model: Kim_Vocal_2 (default), etc.\n"
-        "      --no-infill          Disable Pass 3 targeted infill for missed speech\n"
+        "      --no-cache           Ignore any cached <stem>.vocals16k/.whisper16k.wav\n"
+        "      --multipass          Use the legacy multi-pass timeline pipeline instead of\n"
+        "                           the default per-region segment mode (--legacy alias).\n"
+        "      --no-infill          Multi-pass only: disable Pass 3 infill for missed speech\n"
         "      --pause-split <sec>  Split cues across pauses >= <sec> (default: 1.5, 0=off)\n"
         "      --timeline-json <path> Path to output timeline JSON (default: <output>.timeline.json)\n"
         "      --no-word-timestamps Disable DTW word timing (on by default; it\n"
@@ -97,7 +102,8 @@ int main(int argc, char** argv) {
     std::string input, output, model = kDefaultModel, language = "auto";
     std::string models_dir, download_name, threads_s, stream_s, duration_s, maxline_s;
     bool translate = false, flash = true, word_ts = true, verbose = false;
-    bool center = true; // isolate Front-Center (dialogue) for multichannel sources
+    bool center = false; // default OFF: isolate from the full stereo downmix (--center to
+                         // extract only the Front-Center channel first)
     std::string vocal_model = "Kim_Vocal_2";
     int max_line_length = 42; // Netflix-style default; 0 disables wrapping
     bool dump_audio = false;            // write the 16k mono whisper input to a WAV
@@ -109,6 +115,9 @@ int main(int argc, char** argv) {
     double pause_split = 1.5;           // Pass 2 pause splitting threshold in seconds
     std::string pause_split_s;
     std::string timeline_json;
+    bool use_cache = true;              // reuse an existing <stem>.vocals16k/.whisper16k.wav
+    bool segment_mode_on = true;        // DEFAULT: VAD-segment then per-region transcribe.
+                                        // --multipass selects the legacy timeline pipeline.
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -129,6 +138,9 @@ int main(int argc, char** argv) {
         else if (a == "--vocal-model")     { if (!take(argc, argv, i, "--vocal-model", vocal_model)) return 2; }
         else if (a == "--no-infill")       infill = false;
         else if (a == "--infill")          infill = true;
+        else if (a == "--no-cache")        use_cache = false;
+        else if (a == "--segment-mode")    segment_mode_on = true;  // default; kept for compatibility
+        else if (a == "--multipass" || a == "--legacy") segment_mode_on = false;
         else if (a == "--pause-split" || a == "--pause-split-threshold") { if (!take(argc, argv, i, a.c_str(), pause_split_s)) return 2; }
         else if (a == "--timeline-json")   { if (!take(argc, argv, i, "--timeline-json", timeline_json)) return 2; }
         else if (a == "--word-timestamps") word_ts = true;
@@ -196,6 +208,38 @@ int main(int argc, char** argv) {
     double maxsec = duration_s.empty() ? 0.0 : std::atof(duration_s.c_str());
     std::vector<float> pcm;
 
+    // Cache: if a 16k mono whisper input already sits next to the movie (a prior
+    // run's dump, or the GUI's), load it directly and skip decode + isolation. This
+    // is a big time saver when iterating on transcription/timeline logic - and it
+    // avoids re-running the GPU isolation entirely. Prefer the isolated vocal stem.
+    std::string cached_wav;
+    if (use_cache) {
+        size_t cdot = input.find_last_of('.');
+        std::string cbase = (cdot == std::string::npos) ? input : input.substr(0, cdot);
+        for (const char* suf : { ".vocals16k.wav", ".whisper16k.wav" }) {
+            std::string cand = cbase + suf;
+            FILE* cf = std::fopen(cand.c_str(), "rb");
+            if (cf) { std::fclose(cf); cached_wav = cand; break; }
+        }
+    }
+
+    if (!cached_wav.empty()) {
+        std::fprintf(stderr, "[srt] using cached audio (skipping decode + isolation): %s\n", cached_wav.c_str());
+        logging::logf("INFO", "using cached whisper input %s (skip decode/isolation)", cached_wav.c_str());
+        auto t_c0 = std::chrono::steady_clock::now();
+        audio::DecodeOptions dc;
+        dc.sample_rate = 16000; dc.channels = 1;
+        dc.stream_index = -1; dc.max_seconds = maxsec; dc.center_channel_only = false;
+        if (!audio::decode(cached_wav, dc, pcm, err)) {
+            logging::error("cached audio load failed: " + err);
+            std::fprintf(stderr, "error: %s\n", err.c_str()); return 1;
+        }
+        dur_phase1 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_c0).count();
+        logging::logf("INFO", "Phase 1 (Cached audio load) completed in %s (%.2fs)",
+                      format_duration_hms(dur_phase1).c_str(), dur_phase1);
+        std::fprintf(stderr, "[timing] Phase 1 (Cached audio load): %s\n", format_duration_hms(dur_phase1).c_str());
+        std::fprintf(stderr, "[srt] cached audio ready: %.1f min\n", pcm.size() / 16000.0 / 60.0);
+    } else {
     std::fprintf(stderr, "[srt] decoding (44.1k stereo for separation): %s\n", input.c_str());
     logging::info("decoding for separation");
     audio::DecodeOptions d;
@@ -237,6 +281,7 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "[srt] isolated audio ready: %.1f min\n", pcm.size() / 16000.0 / 60.0);
     logging::logf("INFO", "isolated audio ready %.1f min (%zu samples)", pcm.size() / 16000.0 / 60.0, pcm.size());
+    }
 
     // Optional: dump audio (vocals)
     if (dump_audio) {
@@ -280,7 +325,23 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
-    if (!session.transcribe(pcm, topts, segments, err)) {
+    if (segment_mode_on) {
+        // DEFAULT pipeline: VAD partitions the track into speech regions and each is
+        // transcribed in isolation (no whisper-VAD concatenation, no seam). Leaves
+        // vad_regions empty so the legacy Pass 2/3 block below is skipped entirely.
+        // Pass --multipass/--legacy to use the timeline pipeline instead. See
+        // segment_mode.{h,cpp}.
+        std::fprintf(stderr, "[srt] segment mode: VAD-segmented per-region transcription\n");
+        segment_mode::Options sopts;
+        sopts.vad_model_path = vad_path;
+        if (!segment_mode::run(pcm, session, topts, sopts, segments, err,
+                [](const std::string& m){ std::fprintf(stderr, "  [segment] %s\n", m.c_str()); })) {
+            logging::error("segment-mode failed: " + err);
+            session.close();
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+    } else if (!session.transcribe(pcm, topts, segments, err)) {
         logging::error("transcribe failed: " + err);
         session.close();
         std::fprintf(stderr, "error: %s\n", err.c_str());
@@ -301,7 +362,7 @@ int main(int argc, char** argv) {
         : timeline_json;
 
     timeline::TimelineMap tl_map;
-    if (!vad_regions.empty()) {
+    if (!segment_mode_on && !vad_regions.empty()) {
         std::fprintf(stderr, "[srt] Pass 2: Sanitizing cues against timeline...\n");
         auto t_p4_start = std::chrono::steady_clock::now();
         tl_map = timeline::build_timeline(input, pcm, vad_regions);

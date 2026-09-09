@@ -57,6 +57,7 @@ add_library(srtcore STATIC
   src/separate.cpp
   src/debug.cpp
   src/timeline.cpp
+  src/segment_mode.cpp
 )
 target_include_directories(srtcore PUBLIC
   "${CMAKE_SOURCE_DIR}/src"
