@@ -266,13 +266,20 @@ Either way, the *project's* build is CUDA-free and toolkit-free; whisper DLLs ar
   delete `timeline.{h,cpp}` (~1,065 lines) and the legacy Pass 2/3 code paths, flags, and UI.
   Segment mode is the sole pipeline; it needs neither the patch nor whisper's internal VAD.
 
-### Blockers for the dependency swap (must be resolved on the dev machine)
-- **Vulkan SDK not installed** (`VULKAN_SDK` unset, no `glslc`). Required to build
-  `ggml-vulkan.dll` via `-DGGML_VULKAN=ON`. → install the LunarG Vulkan SDK.
-- **Prebuilt whisper DLLs must be fetched** (`whisper-bin-x64.zip`, CPU base). The agent
-  session cannot download GitHub release assets (CDN blocked); the user fetches the zip, or
-  we mirror it into `third_party/whisper/` like FFmpeg. Pin a release whose headers match
-  the DLLs.
+### Blockers for the dependency swap (just downloads — no SDK required)
+- **Vulkan SDK is NOT required.** Running Vulkan needs only the driver's `vulkan-1.dll`
+  runtime; `ggml-vulkan.dll` ships shaders precompiled to SPIR-V. The SDK is only for
+  *building* the backend from source — which we avoid by reusing a **prebuilt
+  `ggml-vulkan.dll` from llama.cpp** (`llama-bNNNNN-bin-win-vulkan-x64.zip`). ggml is shared
+  between whisper.cpp and llama.cpp and both use `GGML_BACKEND_DL`, so the Vulkan backend is
+  a drop-in — **provided the ggml version/ABI matches** the whisper DLLs. Pin a whisper.cpp
+  release and a llama.cpp build on the same/compatible ggml commit and verify with a drop-in
+  test. SDK build (`-DGGML_VULKAN=ON`, LunarG SDK) is the fallback only if they won't load
+  together.
+- **Fetch two prebuilt zips** (both just downloads; the agent session can't reach the GitHub
+  release CDN, so the user grabs them, mirrored into `third_party/whisper/` like FFmpeg):
+  `whisper-bin-x64.zip` (CPU base: `whisper.dll`, `ggml*.dll`) and the matching
+  `ggml-vulkan.dll` from the llama.cpp Vulkan zip.
 
 ### Revised execution order
 1. **Phase 1 — Remove multi-pass (buildable now, no new deps).** Delete `timeline.{h,cpp}`;
@@ -280,7 +287,8 @@ Either way, the *project's* build is CUDA-free and toolkit-free; whisper DLLs ar
    `--timeline-json` flags, the GUI "Multi-pass mode" checkbox, and the timeline-summary
    code from `main.cpp`/`main_gui.cpp`. Segment mode becomes the only path. Still builds
    whisper from source for now.
-2. **Phase 2 — Dependency swap (needs Vulkan SDK + prebuilt whisper).** Replace
+2. **Phase 2 — Dependency swap (needs prebuilt whisper CPU DLLs + a matching
+   `ggml-vulkan.dll` from llama.cpp; no SDK).** Replace
    `add_subdirectory(third_party/whisper.cpp)` + all `GGML_*`/CUDA settings with a
    `third_party/whisper/{include,lib,bin}` block (import lib + headers + CPU DLLs); build
    `ggml-vulkan.dll` once; wire `ggml_backend_load_all()` + device reporting in
