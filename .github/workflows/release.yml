@@ -51,13 +51,41 @@ jobs:
         shell: pwsh
         run: git -C third_party/whisper.cpp rev-parse HEAD
 
-      - name: Install CUDA Toolkit
+      # Install CUDA from NVIDIA's redist archives directly (the approach
+      # whisper.cpp's own CI uses). This is self-contained and, unlike a curated
+      # sub-package list, guarantees cuda_cccl - which provides crt/host_config.h,
+      # required by CUDA 13's nvcc during CMake's compiler detection.
+      - name: Install CUDA Toolkit ${{ env.CUDA_VERSION }} (redist archives)
         if: steps.cache-whisper.outputs.cache-hit != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.36
-        with:
-          cuda: ${{ env.CUDA_VERSION }}
-          method: network
-          sub-packages: '["nvcc","cudart","cublas","cublas_dev","nvrtc","nvrtc_dev","visual_studio_integration"]'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ env.CUDA_VERSION }}"
+          $short = ($ver -split '\.')[0..1] -join '.'          # 13.0.0 -> 13.0
+          $dir  = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          $base = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $man  = Invoke-RestMethod "$base/redistrib_$ver.json"
+          # Everything ggml-cuda needs to compile + link. CUDA 13 split the
+          # toolchain into separate redist components: cuda_crt carries
+          # include/crt/host_config.h, and libnvvm carries cicc.exe + nvvm - both
+          # required by nvcc and NOT bundled in cuda_nvcc anymore.
+          $components = @('cuda_cudart','cuda_nvcc','cuda_crt','libnvvm','cuda_nvrtc','libcublas','cuda_cccl','cuda_nvtx')
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $tmp = Join-Path $env:RUNNER_TEMP "cuda-redist"; New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          foreach ($c in $components) {
+            $rel = $man.$c.'windows-x86_64'.relative_path
+            if (-not $rel) { throw "CUDA component '$c' missing from redistrib_$ver.json" }
+            $zip = Join-Path $tmp (Split-Path $rel -Leaf)
+            Write-Host "downloading $c ($($man.$c.version)) ..."
+            Invoke-WebRequest "$base/$rel" -OutFile $zip -UseBasicParsing
+            $ex = Join-Path $tmp $c; Expand-Archive -Path $zip -DestinationPath $ex -Force
+            $root = Get-ChildItem $ex -Directory | Select-Object -First 1   # the *-archive folder
+            Copy-Item (Join-Path $root.FullName '*') $dir -Recurse -Force
+          }
+          if (-not (Test-Path "$dir\bin\nvcc.exe")) { throw "nvcc.exe not found after install ($dir)" }
+          "CUDA_PATH=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$dir\bin"       | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "CUDA $ver installed -> $dir"
 
       - name: Install Vulkan SDK
         if: steps.cache-whisper.outputs.cache-hit != 'true'
@@ -70,7 +98,8 @@ jobs:
         if: steps.cache-whisper.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $env:CUDA_PATH = $env:CUDA_PATH  # set by the toolkit action
+          # CUDA_PATH and VULKAN_SDK were exported to GITHUB_ENV by the install
+          # steps above, so they are already in $env: here.
           ./scripts/build-whisper-dlls.ps1 -Jobs 4
 
       - name: Upload whisper DLLs artifact
