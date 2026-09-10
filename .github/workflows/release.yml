@@ -87,12 +87,16 @@ jobs:
           "$dir\bin"       | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           Write-Host "CUDA $ver installed -> $dir"
 
+      # jakoch's action installs the official-layout SDK (Include/ + Lib/vulkan-1.lib)
+      # and exports VULKAN_SDK, so CMake's find_package(Vulkan) resolves it. The
+      # humbletim action installed a layout FindVulkan could not locate.
       - name: Install Vulkan SDK
         if: steps.cache-whisper.outputs.cache-hit != 'true'
-        uses: humbletim/install-vulkan-sdk@v1.2
+        uses: jakoch/install-vulkan-sdk-action@v1.6.0
         with:
-          version: ${{ env.VULKAN_SDK_VERSION }}
+          vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
           cache: true
+          github_token: ${{ github.token }}
 
       - name: Build whisper backend DLLs
         if: steps.cache-whisper.outputs.cache-hit != 'true'
