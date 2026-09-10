@@ -1,0 +1,19 @@
+SRTCreator
+Copyright 2026 Chaitanya Siddeshwar
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles and/or dynamically links third-party components that are
+licensed under their own terms. Those components and their licenses are listed
+in LICENSES/THIRD_PARTY_NOTICES.md, and the full upstream license texts are
+included in the LICENSES/ directory of the distribution. In particular:
+
+  - whisper.cpp / ggml .................. MIT
+  - ONNX Runtime ....................... MIT
+  - FFmpeg (LGPL shared, audio path) ... LGPL-2.1-or-later (dynamically linked)
+  - DirectML ........................... Microsoft redistributable
+  - NVIDIA CUDA runtime (GPU pack) ..... NVIDIA CUDA EULA
+  - Microsoft Visual C++ runtime ....... Microsoft redistributable
+
+Speech-recognition and vocal-isolation model weights are NOT bundled; they are
+downloaded on first run from their respective sources under their own licenses.

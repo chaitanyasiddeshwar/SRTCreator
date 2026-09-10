@@ -172,46 +172,52 @@ falls back appropriately.
 
 ## Building from source
 
-The build is **split** so contributors hacking on the app need only MSVC — no
-CUDA, no Vulkan SDK.
+Nothing binary is committed: the repo tracks only source, the `whisper.cpp`
+submodule, and the scripts that fetch/build every third-party dependency into the
+git-ignored `third_party/{ffmpeg,onnxruntime,whisper}` trees. The build is **split**
+so contributors hacking on the app need only MSVC — no CUDA, no Vulkan SDK. Only the
+one-time *deps build* of the whisper backend DLLs needs the GPU toolkits.
 
-### App build (common — MSVC only)
+> **Windows long paths:** `whisper.cpp` has deep example paths (Android/SwiftUI)
+> that can exceed Windows' 260-char limit. Before cloning, run
+> `git config --global core.longpaths true` (and keep the clone path short, e.g.
+> `C:\src\SRTCreator`), or the submodule checkout fails with "Filename too long".
+
+### Fresh clone → working exe
 
 Prerequisites: **Visual Studio 2022 Build Tools** (MSVC v143 C++ x64; Ninja + CMake
-come with the "C++ CMake tools" component) and **Git**.
+come with the "C++ CMake tools" component), **Git**, and — for the deps build only —
+the **CUDA Toolkit** (`CUDA_PATH`) and the **Vulkan SDK** (`VULKAN_SDK`).
 
 ```
-git clone <your-repo-url> SRTCreator
+git config --global core.longpaths true
+git clone --recursive <your-repo-url> SRTCreator
 cd SRTCreator
 
-:: 1. Fetch the pinned FFmpeg + ONNX/DirectML dev libraries into third_party\
+:: 1. Fetch the pinned FFmpeg (BtbN LGPL) + ONNX Runtime/DirectML (NuGet) libs.
 powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1
 
-:: 2. Ensure the prebuilt whisper backend DLLs are present in third_party\whisper\
-::    (produced by the deps build below; on a fresh clone, run that once first)
+:: 2. Deps build: compile the whisper/ggml backend DLLs (CPU+CUDA+Vulkan) into
+::    third_party\whisper\. One-time; needs the CUDA Toolkit + Vulkan SDK (~20-40 min).
+powershell -ExecutionPolicy Bypass -File scripts\build-whisper-dlls.ps1
 
-:: 3. Build (MSVC only - no CUDA/nvcc)
+:: 3. App build (MSVC only - no CUDA/nvcc).
 build.bat            :: -> build\srt.exe, build\srtgui.exe (+ staged runtime DLLs)
 build.bat clean      :: wipe build\ and rebuild
 ```
 
 The exes are thin (~0.6 MB); all heavy code lives in the staged DLLs
-(`whisper.dll`, `ggml*.dll`, the GPU backends, FFmpeg, ONNX/DirectML).
+(`whisper.dll`, `ggml*.dll`, the GPU backends, FFmpeg, ONNX/DirectML). Once
+`third_party\whisper\` exists, day-to-day app work is just step 3 (MSVC only).
 
-### Deps build (rare — only on a whisper version bump)
+### Deps build notes
 
-Produces the coherent `GGML_BACKEND_DL` DLL set (CPU all-variants + CUDA + Vulkan)
-from the pinned `third_party/whisper.cpp` submodule and stages it into
-`third_party/whisper/{bin,lib,include}`. **Build machine / CI only** — needs the
-**CUDA Toolkit** and the **Vulkan SDK**.
-
-```
-git submodule update --init --recursive
-powershell -ExecutionPolicy Bypass -File scripts\build-whisper-dlls.ps1
-```
-
-(`-Backends cuda` builds without the Vulkan SDK; `-Jobs N` caps parallelism if the
-CUDA assembler `ptxas` hits a flaky crash — the script auto-retries regardless.)
+`scripts\build-whisper-dlls.ps1` produces the coherent `GGML_BACKEND_DL` DLL set
+(CPU all-variants + CUDA + Vulkan) from the pinned `third_party/whisper.cpp`
+submodule and stages it into `third_party/whisper/{bin,lib,include}`. Rebuild it
+only on a whisper version bump. `-Backends cuda` builds without the Vulkan SDK;
+`-Jobs N` caps parallelism if the CUDA assembler `ptxas` hits a flaky crash — the
+script auto-retries regardless.
 
 ---
 
@@ -247,8 +253,13 @@ Whisper models are **not** bundled (they download on first run). CI in
 
 ## Licensing
 
-SRTCreator's own code, plus bundled components: whisper.cpp/ggml (MIT), FFmpeg
-(LGPL-2.1+, audio-only, unmodified shared libs, with a relink notice), ONNX Runtime
-(MIT), DirectML (Microsoft redistributable), NVIDIA CUDA runtime (redistributable,
-CUDA pack only), and the Microsoft VC++ runtime. See
-[`LICENSES/THIRD_PARTY_NOTICES.md`](LICENSES/THIRD_PARTY_NOTICES.md).
+SRTCreator's own code is licensed under **Apache-2.0** — see [`LICENSE`](LICENSE)
+and [`NOTICE`](NOTICE).
+
+Bundled/linked third-party components: whisper.cpp/ggml (MIT), FFmpeg (LGPL-2.1+,
+audio-only, unmodified shared libs, with a relink notice), ONNX Runtime (MIT),
+DirectML (Microsoft redistributable), NVIDIA CUDA runtime (redistributable, CUDA
+pack only), and the Microsoft VC++ runtime. Their full notices are in
+[`LICENSES/THIRD_PARTY_NOTICES.md`](LICENSES/THIRD_PARTY_NOTICES.md). Speech and
+vocal-isolation models are not bundled; they download on first run under their own
+licenses.

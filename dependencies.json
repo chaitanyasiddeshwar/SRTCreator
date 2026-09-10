@@ -2,7 +2,7 @@
   "_comment": "Pinned dependency manifest for reproducible builds (modular_proposal.md 12.1). Surfaced in --version / GUI About and release notes; consumed by scripts/fetch-deps.ps1 and scripts/build-whisper-dlls.ps1. Bump here when a dependency is updated.",
   "app": {
     "name": "SRTCreator",
-    "version": "0.2.0"
+    "version": "0.2.1"
   },
   "whisper": {
     "_role": "ASR engine, built to backend-DL DLLs by scripts/build-whisper-dlls.ps1",
@@ -31,17 +31,19 @@
     "sonames": ["avformat-63", "avcodec-63", "avutil-61", "swresample-7"]
   },
   "onnxruntime": {
-    "_role": "MDX-Net vocal isolation via the DirectML execution provider (any DX12 GPU)",
-    "version": "1.24",
+    "_role": "MDX-Net vocal isolation via the DirectML execution provider (any DX12 GPU). Fetched from NuGet (the DirectML build is NOT published as a GitHub release asset).",
+    "version": "1.24.4",
     "ort_api_version": 24,
     "execution_provider": "DirectML",
     "license": "MIT",
-    "source": "https://github.com/microsoft/onnxruntime/releases",
-    "asset": "Microsoft.ML.OnnxRuntime.DirectML.1.24.0.nupkg"
+    "source": "https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML",
+    "asset": "Microsoft.ML.OnnxRuntime.DirectML.1.24.4.nupkg"
   },
   "directml": {
-    "_role": "DirectML runtime paired with the ONNX Runtime DirectML EP",
+    "_role": "DirectML runtime (DirectML.dll) paired with the ONNX Runtime DirectML EP. Fetched from NuGet.",
     "version": "1.15.4",
-    "license": "Microsoft redistributable"
+    "license": "Microsoft redistributable",
+    "source": "https://www.nuget.org/packages/Microsoft.AI.DirectML",
+    "asset": "Microsoft.AI.DirectML.1.15.4.nupkg"
   }
 }

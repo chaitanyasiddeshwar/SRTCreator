@@ -72,6 +72,17 @@ accompany the DirectML redistributable package
 
 ---
 
+## Microsoft Visual C++ Runtime — Microsoft redistributable
+
+The base distribution ships the Visual C++ runtime app-locally (`MSVCP140.dll`,
+`VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`, `VCOMP140.dll`) so end users do not need
+to install the VC++ Redistributable separately.
+
+Copyright (c) Microsoft Corporation. Redistributed under the Microsoft Visual C++
+Redistributable terms, which permit app-local deployment of these runtime DLLs.
+
+---
+
 ## NVIDIA CUDA Runtime — NVIDIA CUDA EULA (GPU pack only)
 
 The optional NVIDIA GPU pack ships the CUDA runtime redistributables

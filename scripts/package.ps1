@@ -65,6 +65,8 @@ Copy-Set $sys @("MSVCP140.dll","VCRUNTIME140.dll","VCRUNTIME140_1.dll","VCOMP140
 # docs + licenses
 Copy-Item (Join-Path $Root "README.md") $baseStage -Force
 Copy-Item (Join-Path $Root "dependencies.json") $baseStage -Force
+Copy-Item (Join-Path $Root "LICENSE") (Join-Path $baseStage "LICENSE") -Force          # our Apache-2.0 license
+Copy-Item (Join-Path $Root "NOTICE")  (Join-Path $baseStage "NOTICE")  -Force
 Copy-Item (Join-Path $Root "LICENSES") (Join-Path $baseStage "LICENSES") -Recurse -Force
 if (Test-Path (Join-Path $Root "third_party\whisper.cpp\LICENSE")) {
     Copy-Item (Join-Path $Root "third_party\whisper.cpp\LICENSE") (Join-Path $baseStage "LICENSES\LICENSE-whisper.txt") -Force
@@ -72,6 +74,49 @@ if (Test-Path (Join-Path $Root "third_party\whisper.cpp\LICENSE")) {
 if (Test-Path (Join-Path $Root "third_party\ffmpeg\LICENSE.txt")) {
     Copy-Item (Join-Path $Root "third_party\ffmpeg\LICENSE.txt") (Join-Path $baseStage "LICENSES\LICENSE-ffmpeg.txt") -Force
 }
+
+# First-run guide. Models are NOT bundled (license + size); they download on first
+# run. This spells out that, plus the optional GPU packs.
+Set-Content -Encoding UTF8 (Join-Path $baseStage "GETTING-STARTED.txt") @"
+SRTCreator v$Version - getting started
+======================================
+
+Quick start (CLI):
+    srt.exe "C:\path\to\Movie.mkv"
+        -> writes C:\path\to\Movie.srt next to the input.
+
+Or run the drag-and-drop GUI:
+    srtgui.exe        (drop a video file onto the window)
+
+MODELS (downloaded on first run - NOT included in this download)
+----------------------------------------------------------------
+Speech-recognition and vocal-isolation models are fetched automatically the
+first time you need them, into:
+    %LOCALAPPDATA%\SRTCreator\models
+The default ASR model is large-v3-turbo-q8_0 (~830 MB). To pre-download it
+without transcribing:
+    srt.exe --download large-v3-turbo-q8_0
+An internet connection is required for this one-time download. Models carry
+their own licenses from their sources (Hugging Face / UVR).
+
+GPU ACCELERATION (optional add-on packs)
+----------------------------------------
+This base download runs on ANY 64-bit Windows PC using the CPU for
+transcription and DirectML (any Direct3D-12 GPU) for vocal isolation.
+For much faster transcription, download ONE GPU pack next to these files:
+
+  * NVIDIA:  SRTCreator-v$Version-win64-cuda-pack.zip
+             Unzip into this same folder. Needs only an NVIDIA driver.
+  * Any GPU: SRTCreator-v$Version-win64-vulkan-pack.zip
+             Unzip into this same folder. Needs only a recent GPU driver.
+
+The app auto-detects the dropped-in backend on startup (CUDA -> Vulkan -> CPU).
+
+LICENSES
+--------
+SRTCreator is licensed under Apache-2.0 (see LICENSE). Bundled third-party
+components and their licenses are listed in NOTICE and LICENSES\.
+"@
 
 # ---------------- CUDA pack ----------------
 $cudaStage = Join-Path $dist "cuda-pack"
@@ -81,6 +126,11 @@ SRTCreator NVIDIA (CUDA) GPU pack.
 Unzip these files NEXT TO srt.exe / srtgui.exe (same folder as the base download).
 The app detects ggml-cuda.dll on startup and uses your NVIDIA GPU automatically.
 Requires an NVIDIA driver only (no CUDA Toolkit install).
+
+LICENSE: this pack redistributes the NVIDIA CUDA runtime libraries
+(cudart64_*, cublas64_*, cublasLt64_*) under the NVIDIA CUDA Toolkit EULA
+(https://docs.nvidia.com/cuda/eula/). ggml-cuda.dll is part of ggml (MIT).
+See LICENSES\ and NOTICE in the base download.
 "@
 
 # ---------------- Vulkan pack ----------------
@@ -91,6 +141,9 @@ SRTCreator Vulkan GPU pack (any modern GPU - NVIDIA / AMD / Intel).
 Unzip ggml-vulkan.dll NEXT TO srt.exe / srtgui.exe (same folder as the base download).
 The app detects it on startup and uses your GPU via the Vulkan driver (already
 installed with any recent GPU driver). No SDK or extra runtime needed.
+
+LICENSE: ggml-vulkan.dll is part of ggml (MIT). See LICENSES\ and NOTICE in the
+base download.
 "@
 
 # ---------------- zip ----------------

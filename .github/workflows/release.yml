@@ -28,6 +28,11 @@ jobs:
   whisper-dlls:
     runs-on: windows-2022
     steps:
+      # whisper.cpp has deep example paths (android/swiftui) that exceed Windows'
+      # 260-char limit on some checkouts; enable long paths before cloning.
+      - name: Enable git long paths
+        run: git config --global core.longpaths true
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -104,9 +109,23 @@ jobs:
           ./build/srt.exe --help
           if ($LASTEXITCODE -ne 0) { throw "srt.exe --help failed" }
 
+      # Version = the tag (v1.2.3 -> 1.2.3) on a tag build, else dependencies.json
+      # app.version for manual/dispatch runs. This makes the zip names match the tag.
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          } else {
+            $v = (Get-Content dependencies.json -Raw | ConvertFrom-Json).app.version
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Packaging version $v"
+
       - name: Package tiered zips
         shell: pwsh
-        run: ./scripts/package.ps1
+        run: ./scripts/package.ps1 -Version ${{ steps.ver.outputs.version }}
 
       - name: Upload distribution
         uses: actions/upload-artifact@v4
@@ -134,12 +153,31 @@ jobs:
           files: dist/*.zip
           generate_release_notes: true
           body: |
-            SRTCreator ${{ github.ref_name }}
+            ## SRTCreator ${{ github.ref_name }}
 
-            - **base** zip: universal win64 (CPU transcription + DirectML vocal isolation).
-            - **cuda-pack**: NVIDIA power pack - unzip next to the exe (driver only).
-            - **vulkan-pack**: any modern GPU - unzip next to the exe (driver only).
+            Generate an `.srt` subtitle file from any movie file, GPU-accelerated.
 
-            > GPU backends are compiled + packaged by CI but validated on GPU
-            > hardware via a separate manual/self-hosted gate (hosted runners have
-            > no GPU). See dependencies.json for pinned component versions.
+            ### Downloads
+            | Download | For | Notes |
+            |---|---|---|
+            | **`...-base.zip`** | Everyone - start here | Universal win64. CPU transcription + DirectML vocal isolation. Self-contained (VC++ runtime included). |
+            | **`...-cuda-pack.zip`** | NVIDIA GPUs | Unzip **into the base folder** for fast CUDA transcription. Needs only an NVIDIA driver. |
+            | **`...-vulkan-pack.zip`** | Any modern GPU | Unzip **into the base folder** for GPU transcription on NVIDIA/AMD/Intel. Needs only a recent GPU driver. |
+
+            ### Install
+            1. Download and unzip **`...-base.zip`**.
+            2. (Optional) For GPU speed, unzip one GPU pack **into the same folder** - the app auto-selects it (CUDA → Vulkan → CPU).
+            3. Run `srt.exe "your.movie.mkv"` (CLI) or `srtgui.exe` (drag-and-drop). See `GETTING-STARTED.txt`.
+
+            ### Models (not bundled - downloaded on first run)
+            ASR / vocal-isolation weights are fetched automatically on first use into
+            `%LOCALAPPDATA%\SRTCreator\models` (default `large-v3-turbo-q8_0`, ~830 MB;
+            requires an internet connection). Pre-fetch with `srt.exe --download large-v3-turbo-q8_0`.
+
+            ### Licensing
+            SRTCreator is Apache-2.0 (`LICENSE`). Bundled third-party components and their
+            licenses are listed in `NOTICE` / `LICENSES\`. Pinned component versions are in
+            `dependencies.json`.
+
+            > GPU backends are compiled + packaged by CI but validated on GPU hardware via a
+            > separate manual/self-hosted gate (hosted runners have no GPU).

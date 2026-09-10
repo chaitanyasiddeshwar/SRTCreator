@@ -24,6 +24,10 @@
 # Python bytecode cache
 __pycache__/
 
+# Claude Code local runtime state (machine-local; not shared)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
 # Editor / OS cruft
 .vscode/
 .idea/
