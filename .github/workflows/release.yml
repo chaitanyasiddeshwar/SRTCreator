@@ -53,7 +53,7 @@ jobs:
 
       - name: Install CUDA Toolkit
         if: steps.cache-whisper.outputs.cache-hit != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: network
@@ -61,7 +61,7 @@ jobs:
 
       - name: Install Vulkan SDK
         if: steps.cache-whisper.outputs.cache-hit != 'true'
-        uses: humbletim/install-vulkan-sdk@v1.1.1
+        uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: ${{ env.VULKAN_SDK_VERSION }}
           cache: true
