@@ -156,6 +156,29 @@ jobs:
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Packaging version $v"
 
+      # The app is built on a runner WITHOUT the CUDA toolkit, so the CUDA runtime
+      # DLLs the cuda-pack ships (cudart/cublas/cublasLt) aren't staged into build\.
+      # Fetch them from the NVIDIA redist archives so package.ps1's cuda-pack can
+      # bundle them (end users then need only an NVIDIA driver). ggml-cuda.dll
+      # itself came from the whisper artifact and is already in build\.
+      - name: Stage CUDA runtime DLLs for the cuda-pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver  = "${{ env.CUDA_VERSION }}"
+          $base = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $man  = Invoke-RestMethod "$base/redistrib_$ver.json"
+          $build = Resolve-Path build
+          $tmp = Join-Path $env:RUNNER_TEMP "cuda-rt"; New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          foreach ($c in 'cuda_cudart','libcublas') {
+            $rel = $man.$c.'windows-x86_64'.relative_path
+            $zip = Join-Path $tmp (Split-Path $rel -Leaf)
+            Invoke-WebRequest "$base/$rel" -OutFile $zip -UseBasicParsing
+            $ex = Join-Path $tmp $c; Expand-Archive $zip -DestinationPath $ex -Force
+            Get-ChildItem $ex -Recurse -Include cudart64_*.dll,cublas64_*.dll,cublasLt64_*.dll |
+              ForEach-Object { Copy-Item $_.FullName (Join-Path $build $_.Name) -Force; Write-Host "staged $($_.Name)" }
+          }
+
       - name: Package tiered zips
         shell: pwsh
         run: ./scripts/package.ps1 -Version ${{ steps.ver.outputs.version }}
